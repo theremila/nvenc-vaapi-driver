@@ -23,6 +23,9 @@ static DRIVER_PATH: OnceCell<PathBuf> = OnceCell::new();
 pub fn build_driver() -> PathBuf {
     DRIVER_PATH
         .get_or_init(|| {
+            if let Some(path) = std::env::var_os("NVENC_TEST_DRIVER") {
+                return std::fs::canonicalize(path).expect("NVENC_TEST_DRIVER library exists");
+            }
             let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
 
             let status = Command::new(env!("CARGO"))

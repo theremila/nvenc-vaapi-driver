@@ -66,6 +66,7 @@ pub unsafe extern "C" fn create_buffer(
             allocated_elements: num_elements,
             storage,
             coded_ready: Mutex::new(false),
+            pending_output: Mutex::new(None),
             mapped: Mutex::new(None),
         };
         let mut pools = state.pools.lock();
@@ -104,6 +105,7 @@ pub unsafe extern "C" fn map_buffer2(
             .buffers
             .find_by_low_bits(buf_id)
             .ok_or(DriverError::InvalidBuffer)?;
+        super::completion::buffer(&pools, k, u64::MAX)?;
         let rec = &pools.buffers[k];
         let flags = if flags == va::VA_MAPBUFFER_FLAG_DEFAULT {
             va::VA_MAPBUFFER_FLAG_READ | va::VA_MAPBUFFER_FLAG_WRITE
@@ -226,6 +228,7 @@ pub unsafe extern "C" fn destroy_buffer(
             .buffers
             .find_by_low_bits(buffer_id)
             .ok_or(DriverError::InvalidBuffer)?;
+        super::completion::buffer(&pools, k, u64::MAX)?;
         if pools.buffers[k].mapped.lock().is_some() {
             return Err(DriverError::InvalidParameter);
         }

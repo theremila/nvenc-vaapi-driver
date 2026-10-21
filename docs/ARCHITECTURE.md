@@ -20,23 +20,35 @@ lifetime. Allocation fails before the invalid-ID sentinel or wraparound.
 4. Begin/render collect a picture's input and parameter buffers.
 5. End validates output, merges sequence and misc controls, lazily opens or
    reconfigures NVENC, and registers input in that session.
-6. NVENC maps input, submits, locks output, copies compressed bytes, unlocks
-   output and unmaps input. No B-frames or lookahead are enabled.
-7. Successful completion publishes a matching coded segment. Sync validates
-   object/readiness; map exposes stable storage until unmap.
+6. NVENC maps and submits input with a distinct output buffer. A session worker
+   blocks for that output, copies compressed bytes, unlocks and unmaps input.
+   Linux uses synchronous NVENC calls; no B-frames or lookahead are enabled.
+7. Sync or coded-buffer mapping waits for the matching completion and publishes
+   its segment. Finite waits include pool-lock acquisition and preserve pending
+   output on timeout. Mapping exposes stable storage until unmap.
 
-Encoding is synchronous. The global pool lock also serialises independent
-contexts within a display. This simplifies resource lifetime but limits
-parallel throughput. An asynchronous implementation must retain a distinct
-coded-buffer/input association until completion; delivering an older picture
-into a newer coded buffer is invalid.
+Each session has four reusable outputs and a bounded work queue. Submission can
+continue while its worker waits for earlier outputs. Input reuse, CPU transfers,
+reconfiguration and resource destruction wait for the affected work. The worker
+never takes the display pool lock. Completed bytes belong to their original
+coded buffer and remain accessible after encoder/context destruction.
 
 ## Resources and teardown
 
-Each `NvencSession` owns one reusable NVENC output buffer and a cache of input
-registrations. Registrations belong to a session, so two contexts may share
+Each `NvencSession` owns its output worker, bounded output pool and input
+registration cache. Registrations belong to a session, so two contexts may share
 one surface safely. Surface destruction unregisters it from all sessions before
 freeing CUDA memory. Driver termination destroys contexts before surfaces.
+
+Encoder creation is ordered across displays. The first backend-owned encoder
+on a CUDA device remains alive until its backend-owned peers close, even if
+its VA context is destroyed earlier. This works around
+[NVIDIA bug 4340965](https://forums.developer.nvidia.com/t/regression-with-use-after-free-linux-drivers-after-520-56-06-inside-nvenc/269974),
+where a runtime timer can reference the first encoder after destruction.
+Only one retired encoder and its CUDA context are retained per active device
+group; its inputs, output buffers and worker are released immediately. This can
+keep one NVENC session slot occupied until that group becomes idle. Native
+encoders opened by other libraries are outside this backend's lifetime registry.
 
 VA images use a host shadow for CPU access. Read mappings of derived internal
 images download current pixels; write mappings upload on unmap. Write-only

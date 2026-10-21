@@ -416,6 +416,7 @@ fn alloc_host_image(
         allocated_elements: 1,
         storage: BufferStorage::Generic(Mutex::new(bytes)),
         coded_ready: Mutex::new(false),
+        pending_output: Mutex::new(None),
         mapped: Mutex::new(None),
     })?;
     let pitches = [pitch, pitch, 0];
@@ -518,6 +519,7 @@ pub(crate) fn upload_image_to_surface(
     if image.width != surf_w || image.height != surf_h {
         return Err(DriverError::InvalidParameter);
     }
+    super::completion::surface(pools, surface_key, u64::MAX)?;
     let cuda_ctx = srec
         .cuda_ctx
         .as_ref()
@@ -606,6 +608,7 @@ pub(crate) fn download_image_from_surface(
     if pitch < surface.width {
         return Err(DriverError::InvalidParameter);
     }
+    super::completion::surface(pools, surface_key, u64::MAX)?;
     let cuda = surface
         .cuda_ctx
         .as_ref()

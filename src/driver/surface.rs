@@ -264,6 +264,7 @@ pub unsafe extern "C" fn destroy_surfaces(
         let ids = unsafe { core::slice::from_raw_parts(surface_list, num_surfaces as usize) };
         for id in ids {
             if let Some(k) = pools.surfaces.find_by_low_bits(*id) {
+                super::completion::surface(&pools, k, u64::MAX)?;
                 // For DMA-BUF-backed surfaces we must unregister from
                 // NVENC first — otherwise the session still holds a
                 // registered_ptr pointing at a CUarray whose backing
@@ -282,17 +283,28 @@ pub unsafe extern "C" fn destroy_surfaces(
 }
 
 pub unsafe extern "C" fn query_surface_status(
-    _ctx: va::VADriverContextP,
-    _render_target: va::VASurfaceID,
+    ctx: va::VADriverContextP,
+    render_target: va::VASurfaceID,
     status: *mut va::VASurfaceStatus,
 ) -> VAStatus {
     guard(|| {
         if status.is_null() {
             return Err(DriverError::InvalidParameter);
         }
-        // Always ready – we are synchronous until NVENC is wired in.
-        // SAFETY: non-null checked.
-        unsafe { *status = va::VASurfaceReady };
+        // SAFETY: libva owns this live context; status was checked above.
+        let state = unsafe { state_from(ctx) }.ok_or(DriverError::InvalidParameter)?;
+        let pools = state.pools.lock();
+        let key = pools
+            .surfaces
+            .find_by_low_bits(render_target)
+            .ok_or(DriverError::InvalidSurface)?;
+        unsafe {
+            *status = if super::completion::surface_ready(&pools, key) {
+                va::VASurfaceReady
+            } else {
+                va::VASurfaceRendering
+            }
+        };
         Ok(())
     })
 }

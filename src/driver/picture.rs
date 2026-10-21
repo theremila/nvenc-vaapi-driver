@@ -17,7 +17,6 @@ use crate::h264;
 use crate::ids::{ContainsKey, SurfaceKey};
 use crate::nvenc::h264_config::{EncoderConfig, H264Profile};
 use core::ffi::c_int;
-use core::ffi::c_void;
 use va_sys as va;
 
 pub unsafe extern "C" fn begin_picture(
@@ -252,6 +251,7 @@ pub unsafe extern "C" fn end_picture(
         let BufferStorage::Coded(slot) = &buf.storage else {
             return Err(DriverError::InvalidBuffer);
         };
+        super::completion::buffer(&pools, cb_key, u64::MAX)?;
         *buf.coded_ready.lock() = false;
         let mut backing = slot.backing.lock();
         backing.clear();
@@ -344,25 +344,9 @@ pub unsafe extern "C" fn end_picture(
             }
         }
 
-        session.encode_frame(target_key, pic_params.force_idr, &mut backing)?;
-        drop(session_guard);
-
-        let seg = va::VACodedBufferSegment {
-            size: u32::try_from(backing.len()).map_err(|_| DriverError::InvalidParameter)?,
-            bit_offset: 0,
-            status: 0,
-            reserved: 0,
-            buf: backing.as_mut_ptr() as *mut c_void,
-            next: core::ptr::null_mut(),
-            va_reserved: [0; 4],
-        };
-        let mut segment = slot.segment.lock();
-        if let Some(existing) = segment.as_mut() {
-            **existing = seg;
-        } else {
-            *segment = Some(Box::new(seg));
-        }
-        *buf.coded_ready.lock() = true;
+        let bytes = core::mem::take(&mut *backing);
+        let pending = session.encode_frame(target_key, pic_params.force_idr, bytes)?;
+        *buf.pending_output.lock() = Some(pending);
         *cctx.last_coded.lock() = Some(cb_key);
         Ok(())
     })
@@ -642,6 +626,25 @@ mod tests {
             0
         );
         assert!(mapped.is_null());
+    }
+
+    #[test]
+    fn zero_timeout_sync_never_waits_for_the_pool_mutex() {
+        let mut f = Fixture::new();
+        let pools = f.state.pools.lock();
+        assert_eq!(
+            unsafe { crate::driver::sync::sync_surface2(&mut *f.ctx, f.surface, 0) },
+            va::VA_STATUS_ERROR_TIMEDOUT as i32
+        );
+        drop(pools);
+        assert_eq!(
+            unsafe { crate::driver::sync::sync_surface2(&mut *f.ctx, f.surface, 0) },
+            0
+        );
+        assert_eq!(
+            unsafe { crate::driver::sync::sync_surface2(&mut *f.ctx, va::VA_INVALID_SURFACE, 0) },
+            va::VA_STATUS_ERROR_INVALID_SURFACE as i32
+        );
     }
 
     #[test]

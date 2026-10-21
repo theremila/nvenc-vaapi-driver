@@ -4,6 +4,8 @@
 
 mod api;
 pub mod h264_config;
+mod lifetime;
+pub(crate) mod output;
 pub mod preset;
 pub mod session;
 

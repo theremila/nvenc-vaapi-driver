@@ -3,11 +3,14 @@
 //! NVENC functions are loaded lazily by the runtime loader. Missing libraries,
 //! unsupported versions and incomplete function tables produce explicit errors.
 //!
-//! Each session caches input registrations and owns one reusable bitstream
-//! buffer. Linux synchronous encoding with no B-frames/lookahead returns
-//! exactly one coded picture for each successful submission.
+//! Each session caches input registrations and owns a bounded output queue.
+//! A worker collects synchronous Linux NVENC outputs while the caller submits
+//! pictures. No B-frames/lookahead are enabled; each output retains its picture.
 
-use super::api::{self, EncodeApi};
+use super::{
+    api,
+    output::{EncodedFrame, OutputRuntime},
+};
 use crate::error::DriverError;
 use crate::ids::SurfaceKey;
 use crate::nvenc::h264_config::{self, EncoderConfig, H264Profile};
@@ -39,7 +42,8 @@ pub struct NvencSession {
     preset_guid: nv::GUID,
     tuning: nv::NV_ENC_TUNING_INFO,
     registered: HashMap<SurfaceKey, RegisteredSurface>,
-    bitstream: nv::NV_ENC_OUTPUT_PTR,
+    output: OutputRuntime,
+    next_frame: u64,
 }
 
 // SAFETY: the NVENC encoder handle is an opaque driver resource; all access
@@ -62,14 +66,12 @@ impl NvencSession {
 
         let api = api::get()?;
 
+        // Keep opening and initialising ordered across concurrent displays.
+        let _creation = super::lifetime::CREATE.lock();
         // 1. Open session.
-        let mut encoder: *mut c_void = core::ptr::null_mut();
         let mut session_params = open_session_ex_params(cuda.cu_ctx() as *mut c_void);
-        // SAFETY: session_params is a valid initialised struct with correct VER.
-        let status = unsafe { (api.open_encode_session_ex)(&mut session_params, &mut encoder) };
-        if status != nv::NVENCSTATUS::NV_ENC_SUCCESS || encoder.is_null() {
-            return Err(DriverError::OperationFailed("NvEncOpenEncodeSessionEx"));
-        }
+        let lease = super::lifetime::EncoderLease::open(cuda.clone(), &mut session_params)?;
+        let encoder = lease.handle;
 
         // 2. Translate high-level config → NVENC primitives.
         let (preset_guid, tuning) = map_preset_choice(cfg);
@@ -99,8 +101,6 @@ impl NvencSession {
             )
         };
         if status != nv::NVENCSTATUS::NV_ENC_SUCCESS {
-            // SAFETY: encoder is live and has no pending work.
-            unsafe { (api.destroy_encoder)(encoder) };
             return Err(DriverError::OperationFailed("NvEncGetEncodePresetConfigEx"));
         }
         // SAFETY: successful H.264 preset output; normalise the only nested
@@ -126,25 +126,10 @@ impl NvencSession {
         // the call (lives until function return).
         let status = unsafe { (api.initialize_encoder)(encoder, &mut init) };
         if status != nv::NVENCSTATUS::NV_ENC_SUCCESS {
-            // SAFETY: encoder valid.
-            unsafe { (api.destroy_encoder)(encoder) };
             return Err(DriverError::OperationFailed("NvEncInitializeEncoder"));
         }
 
-        // One reusable output is sufficient: each call locks and unlocks it
-        // before returning, so additional buffers only consume video memory.
-        // SAFETY: POD descriptor, fields below select its ABI version.
-        let mut params: nv::NV_ENC_CREATE_BITSTREAM_BUFFER = unsafe { core::mem::zeroed() };
-        params.version = nv::NV_ENC_CREATE_BITSTREAM_BUFFER_VER;
-        params.memoryHeap = nv::NV_ENC_MEMORY_HEAP::NV_ENC_MEMORY_HEAP_VID;
-        // SAFETY: encoder is live and the descriptor is correctly versioned.
-        if unsafe { (api.create_bitstream_buffer)(encoder, &mut params) }
-            != nv::NVENCSTATUS::NV_ENC_SUCCESS
-        {
-            // SAFETY: no bitstream buffer was created; close the session.
-            unsafe { (api.destroy_encoder)(encoder) };
-            return Err(DriverError::OperationFailed("NvEncCreateBitstreamBuffer"));
-        }
+        let output = OutputRuntime::new(lease)?;
 
         Ok(Self {
             encoder,
@@ -154,7 +139,8 @@ impl NvencSession {
             preset_guid,
             tuning,
             registered: HashMap::new(),
-            bitstream: params.bitstreamBuffer,
+            output,
+            next_frame: 0,
         })
     }
 
@@ -283,63 +269,74 @@ impl NvencSession {
         }
     }
 
-    /// Synchronous, one-input/one-output encode. No lookahead or B-frames
-    /// are enabled; returning an older frame for a new VA coded buffer would
-    /// corrupt timestamps and references. Never report empty output as success.
+    /// Submit one picture; completion owns its matching output and input map.
     pub fn encode_frame(
         &mut self,
         key: SurfaceKey,
         force_idr: bool,
-        output: &mut Vec<u8>,
-    ) -> Result<(), DriverError> {
+        bytes: Vec<u8>,
+    ) -> Result<Arc<EncodedFrame>, DriverError> {
+        let next = self
+            .next_frame
+            .checked_add(1)
+            .ok_or(DriverError::Encoding("frame counter exhausted"))?;
         self._cuda_ctx
             .bind_to_thread()
             .map_err(|_| DriverError::OperationFailed("cuda bind_to_thread"))?;
+        self.output.wait_surface(key, u64::MAX)?;
         let api = api::get()?;
         let reg = self
             .registered
             .get(&key)
             .ok_or(DriverError::InvalidSurface)?;
-        // SAFETY: POD descriptor, version and registered resource set below.
+        let output = self.output.acquire()?;
+        // SAFETY: versioned POD mapping descriptor for this live registration.
         let mut map: nv::NV_ENC_MAP_INPUT_RESOURCE = unsafe { core::mem::zeroed() };
         map.version = nv::NV_ENC_MAP_INPUT_RESOURCE_VER;
         map.registeredResource = reg.registered_ptr;
-        // SAFETY: registered resource belongs to this live encoder.
+        // SAFETY: registration belongs to this encoder and outlives the job.
         if crate::profiling::timed!(InputMap, unsafe {
             (api.map_input_resource)(self.encoder, &mut map)
         }) != nv::NVENCSTATUS::NV_ENC_SUCCESS
         {
+            self.output.recycle(output);
             return Err(DriverError::OperationFailed("NvEncMapInputResource"));
         }
-        let handle = self.bitstream;
         let mut pic = pic_params(
             reg.width,
             reg.height,
             reg.pitch,
             map.mappedResource,
-            handle,
+            output.handle,
             force_idr,
         );
-        // SAFETY: all resources remain live until lock/unmap completes.
+        pic.frameIdx = self.next_frame as u32;
+        pic.inputTimeStamp = self.next_frame;
+        pic.inputDuration = 1;
+        // SAFETY: input/output stay owned until the output worker finishes.
         let status = crate::profiling::timed!(Submit, unsafe {
             (api.encode_picture)(self.encoder, &mut pic)
         });
-        let result = if status == nv::NVENCSTATUS::NV_ENC_SUCCESS {
-            self.lock_and_copy(api, handle, output)
-        } else {
-            Err(DriverError::Encoding(
-                "NvEncEncodePicture: synchronous output unavailable",
-            ))
-        };
-        // SAFETY: paired with the successful map, including error paths.
-        let unmap = crate::profiling::timed!(InputUnmap, unsafe {
-            (api.unmap_input_resource)(self.encoder, map.mappedResource)
-        });
-        result?;
-        if unmap != nv::NVENCSTATUS::NV_ENC_SUCCESS {
-            return Err(DriverError::OperationFailed("NvEncUnmapInputResource"));
+        if status != nv::NVENCSTATUS::NV_ENC_SUCCESS {
+            self.output.fail();
+            // SAFETY: pair the input map on failed submission.
+            unsafe { (api.unmap_input_resource)(self.encoder, map.mappedResource) };
+            self.output.recycle(output);
+            return Err(DriverError::Encoding(
+                "NvEncEncodePicture: output unavailable",
+            ));
         }
-        Ok(())
+        let sequence = self.next_frame;
+        self.next_frame = next;
+        self.output
+            .enqueue(output, map.mappedResource, key, sequence, bytes)
+    }
+
+    pub fn wait_surface(&self, key: SurfaceKey, timeout_ns: u64) -> Result<(), DriverError> {
+        self.output.wait_surface(key, timeout_ns)
+    }
+    pub fn surface_ready(&self, key: SurfaceKey) -> bool {
+        self.output.surface_ready(key)
     }
 
     /// Best-effort runtime reconfiguration. On failure we keep the old config
@@ -363,6 +360,7 @@ impl NvencSession {
         self._cuda_ctx
             .bind_to_thread()
             .map_err(|_| DriverError::OperationFailed("cuda bind_to_thread"))?;
+        self.output.wait_all()?;
         let api = api::get()?;
 
         // Preserve the successful preset configuration. A bitrate update
@@ -393,60 +391,6 @@ impl NvencSession {
     pub fn config(&self) -> &EncoderConfig {
         &self.config
     }
-
-    // -------- internals --------
-
-    fn lock_and_copy(
-        &mut self,
-        api: &EncodeApi,
-        slot_handle: nv::NV_ENC_OUTPUT_PTR,
-        data: &mut Vec<u8>,
-    ) -> Result<(), DriverError> {
-        // Output-only enum fields may be zero; never form an invalid Rust enum.
-        let mut storage = MaybeUninit::<nv::NV_ENC_LOCK_BITSTREAM>::zeroed();
-        let lock = storage.as_mut_ptr();
-        // SAFETY: writable C storage; no typed value is created.
-        unsafe {
-            core::ptr::addr_of_mut!((*lock).version).write(nv::NV_ENC_LOCK_BITSTREAM_VER);
-            core::ptr::addr_of_mut!((*lock).outputBitstream).write(slot_handle);
-        }
-        // SAFETY: encoder valid, slot_handle from CreateBitstreamBuffer.
-        let s = crate::profiling::timed!(Lock, unsafe { (api.lock_bitstream)(self.encoder, lock) });
-        if s != nv::NVENCSTATUS::NV_ENC_SUCCESS {
-            return Err(DriverError::Encoding("NvEncLockBitstream"));
-        }
-        // SAFETY: successful SDK output; read only the initialised scalar fields.
-        let (len, bytes) = unsafe {
-            (
-                core::ptr::addr_of!((*lock).bitstreamSizeInBytes).read() as usize,
-                core::ptr::addr_of!((*lock).bitstreamBufferPtr).read(),
-            )
-        };
-        let result = (|| {
-            if len == 0 || bytes.is_null() {
-                return Err(DriverError::Encoding("NVENC returned an empty picture"));
-            }
-            // Reuse the VA coded buffer allocation across frames. Only
-            // compressed bytes cross this boundary; raw input stays on CUDA.
-            data.clear();
-            data.try_reserve(len)
-                .map_err(|_| DriverError::AllocFailed)?;
-            // SAFETY: NVENC returned a non-null, locked buffer of len bytes;
-            // the destination has capacity for exactly those bytes.
-            crate::profiling::timed!(BitstreamCopy, unsafe {
-                core::ptr::copy_nonoverlapping(bytes.cast::<u8>(), data.as_mut_ptr(), len);
-                data.set_len(len);
-            });
-            Ok(())
-        })();
-        // SAFETY: paired with a successful lock, also on allocation failure.
-        let status = unsafe { (api.unlock_bitstream)(self.encoder, slot_handle) };
-        result?;
-        if status != nv::NVENCSTATUS::NV_ENC_SUCCESS {
-            return Err(DriverError::OperationFailed("NvEncUnlockBitstream"));
-        }
-        Ok(())
-    }
 }
 
 impl Drop for NvencSession {
@@ -457,19 +401,18 @@ impl Drop for NvencSession {
         let Ok(api) = api::get() else {
             return;
         };
+        self.output.drain();
         let mut eos = eos_params();
-        // SAFETY: synchronous outputs are complete; flush before releasing resources.
+        // SAFETY: all submitted outputs are complete; EOS flushes the live
+        // encoder before any registrations or bitstream buffers are released.
         unsafe { (api.encode_picture)(self.encoder, eos.as_mut_ptr()) };
-        // SAFETY: bitstream came from this encoder and is not locked.
-        unsafe { (api.destroy_bitstream_buffer)(self.encoder, self.bitstream) };
         // Unregister all surfaces.
         for reg in self.registered.values() {
             // SAFETY: registered_ptr came from RegisterResource.
             unsafe { (api.unregister_resource)(self.encoder, reg.registered_ptr) };
         }
-        // Tear down the encoder.
-        // SAFETY: encoder valid until this call.
-        unsafe { (api.destroy_encoder)(self.encoder) };
+        // OutputRuntime joins the worker and destroys outputs/encoder after
+        // all session-local input registrations have been removed.
     }
 }
 

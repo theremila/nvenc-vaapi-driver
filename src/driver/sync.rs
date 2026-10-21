@@ -1,50 +1,73 @@
-//! Encoding completes synchronously in vaEndPicture. Synchronisation still
-//! validates IDs/readiness so invalid or unsubmitted buffers cannot look ready.
+//! Synchronise output publication and surface lifetime, including finite waits.
 use super::{guard, state_from};
-use crate::driver::state::BufferStorage;
+use crate::driver::state::{BufferStorage, DriverState, Pools};
 use crate::error::{DriverError, VAStatus};
 use crate::ids::ContainsKey;
+use parking_lot::MutexGuard;
+use std::time::{Duration, Instant};
 use va_sys as va;
+
+fn lock_pools(
+    state: &DriverState,
+    timeout_ns: u64,
+) -> Result<MutexGuard<'_, Pools>, DriverError> {
+    if timeout_ns == u64::MAX {
+        Ok(state.pools.lock())
+    } else {
+        state
+            .pools
+            .try_lock_for(Duration::from_nanos(timeout_ns))
+            .ok_or(DriverError::TimedOut)
+    }
+}
 
 pub unsafe extern "C" fn sync_surface(
     ctx: va::VADriverContextP,
     target: va::VASurfaceID,
 ) -> VAStatus {
-    guard(|| {
-        // SAFETY: caller supplies a live driver context.
-        let state = unsafe { state_from(ctx) }.ok_or(DriverError::InvalidParameter)?;
-        state
-            .pools
-            .lock()
-            .surfaces
-            .find_by_low_bits(target)
-            .ok_or(DriverError::InvalidSurface)?;
-        Ok(())
-    })
+    // SAFETY: same arguments and lifetime contract as the timed variant.
+    unsafe { sync_surface2(ctx, target, u64::MAX) }
 }
-
 pub unsafe extern "C" fn sync_surface2(
     ctx: va::VADriverContextP,
     target: va::VASurfaceID,
-    _timeout_ns: u64,
+    timeout_ns: u64,
 ) -> VAStatus {
-    // SAFETY: synchronous implementation has the same preconditions.
-    unsafe { sync_surface(ctx, target) }
+    guard(|| {
+        let started = Instant::now();
+        // SAFETY: libva owns this live driver context.
+        let state = unsafe { state_from(ctx) }.ok_or(DriverError::InvalidParameter)?;
+        let pools = lock_pools(state, timeout_ns)?;
+        let key = pools
+            .surfaces
+            .find_by_low_bits(target)
+            .ok_or(DriverError::InvalidSurface)?;
+        super::completion::surface(
+            &pools,
+            key,
+            super::completion::remaining(timeout_ns, started),
+        )
+    })
 }
-
 pub unsafe extern "C" fn sync_buffer(
     ctx: va::VADriverContextP,
     id: va::VABufferID,
-    _timeout_ns: u64,
+    timeout_ns: u64,
 ) -> VAStatus {
     guard(|| {
-        // SAFETY: caller supplies a live driver context.
+        let started = Instant::now();
+        // SAFETY: libva owns this live driver context.
         let state = unsafe { state_from(ctx) }.ok_or(DriverError::InvalidParameter)?;
-        let pools = state.pools.lock();
+        let pools = lock_pools(state, timeout_ns)?;
         let key = pools
             .buffers
             .find_by_low_bits(id)
             .ok_or(DriverError::InvalidBuffer)?;
+        super::completion::buffer(
+            &pools,
+            key,
+            super::completion::remaining(timeout_ns, started),
+        )?;
         let rec = &pools.buffers[key];
         if matches!(rec.storage, BufferStorage::Coded(_)) && !*rec.coded_ready.lock() {
             return Err(DriverError::OperationFailed(

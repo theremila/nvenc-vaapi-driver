@@ -30,7 +30,11 @@ changes, shared input across contexts, stale IDs and live-resource termination.
 Image ABI tests compare full-frame and cropped NV12 readback byte for byte,
 exercise mapping access flags and copies between derived surfaces, and reject
 mapped buffers, invalid rectangles and stale surface handles.
-Increase `NVENC_TEST_FRAMES` for longer stability runs.
+Queued-output tests map pictures in reverse order after destroying their input
+surfaces and encoder, then decode each picture to verify pixel identity. Keep
+hardware ABI tests concurrent to exercise independently closing encoders.
+Increase `NVENC_TEST_FRAMES` for longer stability runs. Set `NVENC_TEST_DRIVER`
+to an existing shared library to run ABI controls without rebuilding it.
 
 ## Performance
 
@@ -62,7 +66,8 @@ aggregate nanoseconds for host images, CUDA copies and NVENC operations.
 These counters contain no device identity or image data.
 
 Timings include CPU waiting and are not GPU kernel timings. End-picture time
-includes its nested stages; do not sum them together. Counters accumulate
+includes submission stages and queue waits; output locking runs on the worker.
+Stages can overlap across threads, so do not sum them together. Counters accumulate
 across displays in the process. Ordinary builds compile out the timers and
 atomic counters. Use ordinary builds for final throughput comparisons.
 

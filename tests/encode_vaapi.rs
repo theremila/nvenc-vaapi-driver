@@ -546,3 +546,180 @@ fn derived_images_copy_between_surfaces_and_reject_stale_surface() {
         }
     }
 }
+
+#[test]
+#[ignore = "requires a live NVIDIA GPU, render node and ffmpeg"]
+fn queued_outputs_keep_picture_identity_after_resource_destruction() {
+    let mut d = Driver::new();
+    let ctx = &mut *d.ctx as *mut va::VADriverContext;
+    let mut config = va::VA_INVALID_ID;
+    let mut context = va::VA_INVALID_ID;
+    let mut surfaces = [va::VA_INVALID_SURFACE; 4];
+    let mut coded = [va::VA_INVALID_ID; 12];
+    // SAFETY: arrays and parameter structs remain live and are sized as passed.
+    unsafe {
+        assert_eq!(
+            d.vt.vaCreateConfig.unwrap()(
+                ctx,
+                va::VAProfileH264Main,
+                va::VAEntrypointEncSlice,
+                std::ptr::null_mut(),
+                0,
+                &mut config
+            ),
+            0
+        );
+        assert_eq!(
+            d.vt.vaCreateSurfaces2.unwrap()(
+                ctx,
+                va::VA_RT_FORMAT_YUV420,
+                512,
+                288,
+                surfaces.as_mut_ptr(),
+                4,
+                std::ptr::null_mut(),
+                0
+            ),
+            0
+        );
+        assert_eq!(
+            d.vt.vaCreateContext.unwrap()(
+                ctx,
+                config,
+                512,
+                288,
+                0,
+                surfaces.as_mut_ptr(),
+                4,
+                &mut context
+            ),
+            0
+        );
+        for (frame, output) in coded.iter_mut().enumerate() {
+            assert_eq!(
+                d.vt.vaCreateBuffer.unwrap()(
+                    ctx,
+                    context,
+                    va::VAEncCodedBufferType,
+                    512 * 288,
+                    1,
+                    std::ptr::null_mut(),
+                    output
+                ),
+                0
+            );
+            let mut image: va::VAImage = std::mem::zeroed();
+            let surface = surfaces[frame % surfaces.len()];
+            assert_eq!(d.vt.vaDeriveImage.unwrap()(ctx, surface, &mut image), 0);
+            let mut ptr = std::ptr::null_mut();
+            assert_eq!(
+                d.vt.vaMapBuffer2.unwrap()(ctx, image.buf, &mut ptr, va::VA_MAPBUFFER_FLAG_WRITE),
+                0
+            );
+            let bytes = std::slice::from_raw_parts_mut(ptr.cast::<u8>(), image.data_size as usize);
+            bytes.fill(128);
+            for y in 0..288usize {
+                bytes[y * image.pitches[0] as usize..y * image.pitches[0] as usize + 512]
+                    .fill(24 + frame as u8 * 16);
+            }
+            assert_eq!(d.vt.vaUnmapBuffer.unwrap()(ctx, image.buf), 0);
+            assert_eq!(d.vt.vaDestroyImage.unwrap()(ctx, image.image_id), 0);
+            let mut params = Vec::new();
+            if frame == 0 {
+                let mut seq: va::VAEncSequenceParameterBufferH264 = std::mem::zeroed();
+                seq.picture_width_in_mbs = 32;
+                seq.picture_height_in_mbs = 18;
+                seq.bits_per_second = 5_000_000;
+                seq.intra_idr_period = 1;
+                seq.time_scale = 120;
+                seq.num_units_in_tick = 1;
+                params.push(d.buffer(context, va::VAEncSequenceParameterBufferType, &mut seq));
+            }
+            let mut picture: va::VAEncPictureParameterBufferH264 = std::mem::zeroed();
+            picture.coded_buf = *output;
+            picture.pic_init_qp = 28;
+            picture.pic_fields.bits.as_mut().set_idr_pic_flag(1);
+            params.push(d.buffer(context, va::VAEncPictureParameterBufferType, &mut picture));
+            assert_eq!(d.vt.vaBeginPicture.unwrap()(ctx, context, surface), 0);
+            assert_eq!(
+                d.vt.vaRenderPicture.unwrap()(
+                    ctx,
+                    context,
+                    params.as_mut_ptr(),
+                    params.len() as i32
+                ),
+                0
+            );
+            assert_eq!(d.vt.vaEndPicture.unwrap()(ctx, context), 0);
+            for param in params {
+                assert_eq!(d.vt.vaDestroyBuffer.unwrap()(ctx, param), 0);
+            }
+            let mut status = va::VASurfaceSkipped;
+            assert_eq!(
+                d.vt.vaQuerySurfaceStatus.unwrap()(ctx, surface, &mut status),
+                0
+            );
+            assert!(status == va::VASurfaceReady || status == va::VASurfaceRendering);
+        }
+        let poll = d.vt.vaSyncBuffer.unwrap()(ctx, coded[11], 0);
+        assert!(poll == 0 || poll == va::VA_STATUS_ERROR_TIMEDOUT as i32);
+        assert_eq!(d.vt.vaSyncBuffer.unwrap()(ctx, coded[11], 5_000_000_000), 0);
+        // Input allocations, registrations and encoder can disappear while the
+        // original coded buffers retain independently owned, matching bytes.
+        assert_eq!(
+            d.vt.vaDestroySurfaces.unwrap()(ctx, surfaces.as_mut_ptr(), 4),
+            0
+        );
+        assert_eq!(d.vt.vaDestroyContext.unwrap()(ctx, context), 0);
+        for (frame, output) in coded.iter().enumerate().rev() {
+            let mut ptr = std::ptr::null_mut();
+            assert_eq!(d.vt.vaMapBuffer.unwrap()(ctx, *output, &mut ptr), 0);
+            let segment = &*ptr.cast::<va::VACodedBufferSegment>();
+            let bytes = std::slice::from_raw_parts(segment.buf.cast::<u8>(), segment.size as usize)
+                .to_vec();
+            assert_eq!(d.vt.vaUnmapBuffer.unwrap()(ctx, *output), 0);
+            let mut child = std::process::Command::new("ffmpeg")
+                .args([
+                    "-v",
+                    "error",
+                    "-f",
+                    "h264",
+                    "-i",
+                    "pipe:0",
+                    "-frames:v",
+                    "1",
+                    "-pix_fmt",
+                    "nv12",
+                    "-f",
+                    "rawvideo",
+                    "pipe:1",
+                ])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            use std::io::Write;
+            child.stdin.take().unwrap().write_all(&bytes).unwrap();
+            let decoded = child.wait_with_output().unwrap();
+            assert!(
+                decoded.status.success(),
+                "{}",
+                String::from_utf8_lossy(&decoded.stderr)
+            );
+            assert!(decoded.stderr.is_empty());
+            assert_eq!(decoded.stdout.len(), 512 * 288 * 3 / 2);
+            let mean = decoded.stdout[..512 * 288]
+                .iter()
+                .map(|&y| u64::from(y))
+                .sum::<u64>() as f64
+                / (512.0 * 288.0);
+            assert!(
+                (mean - (24 + frame * 16) as f64).abs() <= 2.0,
+                "wrong output: frame={frame}, mean={mean}"
+            );
+            assert_eq!(d.vt.vaDestroyBuffer.unwrap()(ctx, *output), 0);
+        }
+        assert_eq!(d.vt.vaDestroyConfig.unwrap()(ctx, config), 0);
+    }
+}

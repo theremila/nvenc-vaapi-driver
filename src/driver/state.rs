@@ -234,6 +234,8 @@ pub struct BufferRec {
     /// Coded-segment header scratch; for EncCodedBufferType we hand back a
     /// VACodedBufferSegment chain written at the head of `storage`.
     pub coded_ready: Mutex<bool>,
+    /// The exact submitted picture awaiting publication into this buffer.
+    pub pending_output: Mutex<Option<std::sync::Arc<crate::nvenc::output::EncodedFrame>>>,
     /// Active map access flags; None means unmapped.
     pub mapped: Mutex<Option<u32>>,
 }
