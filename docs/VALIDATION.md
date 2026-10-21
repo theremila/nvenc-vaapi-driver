@@ -35,6 +35,9 @@ Increase `NVENC_TEST_FRAMES` for longer stability runs.
 python3 tools/benchmark-encode.py --help
 ```
 
+Use `--drivers-path DIR` to compare release builds without replacing the
+installed library. Alternate old/new build order and compare repeated runs.
+
 Compare VA-API, native NVENC and software encoding with identical input, output
 geometry, bitrate, frame count and pacing. Record throughput, latency, CPU time,
 resident memory and GPU measurements. Input generation and upload contribute

@@ -15,8 +15,8 @@
 //! 3. Client memcpy's Y and UV planes.
 //! 4. Client `vaUnmapBuffer(image.buf)` → we look the image up in
 //!    `DriverState.pools.images`, and if the surface is CUDA-resident
-//!    (`SurfaceKind::Internal`), we issue two `cuMemcpy2D_v2` calls (Y plane
-//!    and UV plane) host → device.
+//!    (`SurfaceKind::Internal`), one pitched `cuMemcpy2D_v2` transfers both
+//!    contiguous NV12 planes from host to device.
 
 use super::{guard, state_from};
 use crate::driver::state::{BufferRec, BufferStorage, DriverState, ImageRec, Pools, SurfaceKind};
@@ -485,16 +485,17 @@ pub(crate) fn upload_image_to_surface(
         CUDA_MEMCPY2D_st, CUdeviceptr, CUmemorytype, CUresult, cuMemcpy2D_v2,
     };
 
-    let host_y = bytes.as_ptr();
-    // SAFETY: UV plane starts at `offsets[1]` bytes into the same live Vec.
-    let host_uv = unsafe { host_y.add(image.offsets[1] as usize) };
-
-    // Y plane.
-    let y_copy = CUDA_MEMCPY2D_st {
+    let rows = nv12_upload_rows(image)?;
+    if surf_pitch < surf_w {
+        return Err(DriverError::InvalidParameter);
+    }
+    // Both planes use the same pitch and are adjacent in driver-owned images
+    // and surfaces. One 2D transfer avoids a second synchronous CUDA call.
+    let copy = CUDA_MEMCPY2D_st {
         srcXInBytes: 0,
         srcY: 0,
         srcMemoryType: CUmemorytype::CU_MEMORYTYPE_HOST,
-        srcHost: host_y as *const core::ffi::c_void,
+        srcHost: bytes.as_ptr().cast(),
         srcDevice: 0,
         srcArray: core::ptr::null_mut(),
         srcPitch: image.pitches[0] as usize,
@@ -506,50 +507,84 @@ pub(crate) fn upload_image_to_surface(
         dstArray: core::ptr::null_mut(),
         dstPitch: surf_pitch as usize,
         WidthInBytes: surf_w as usize,
-        Height: surf_h as usize,
+        Height: rows,
     };
-    // SAFETY: Host pointer is derived from a live `&[u8]` whose length is
-    // >= pitches[0] * height; device pointer came from cuMemAllocPitch_v2
-    // on the bound context and is at least `surf_pitch * surf_h * 3 / 2`
-    // bytes; pitches satisfy CUDA 2D copy alignment (pitch >= width).
-    let r = unsafe { cuMemcpy2D_v2(&y_copy) };
-    if r != CUresult::CUDA_SUCCESS {
-        return Err(DriverError::OperationFailed("cuMemcpy2D_v2 Y plane"));
-    }
-
-    // UV plane.
-    let uv_dst = cu_ptr
-        .checked_add((surf_pitch as u64) * (surf_h as u64))
-        .ok_or(DriverError::InvalidParameter)?;
-    let uv_copy = CUDA_MEMCPY2D_st {
-        srcXInBytes: 0,
-        srcY: 0,
-        srcMemoryType: CUmemorytype::CU_MEMORYTYPE_HOST,
-        srcHost: host_uv as *const core::ffi::c_void,
-        srcDevice: 0,
-        srcArray: core::ptr::null_mut(),
-        srcPitch: image.pitches[1] as usize,
-        dstXInBytes: 0,
-        dstY: 0,
-        dstMemoryType: CUmemorytype::CU_MEMORYTYPE_DEVICE,
-        dstHost: core::ptr::null_mut(),
-        dstDevice: uv_dst as CUdeviceptr,
-        dstArray: core::ptr::null_mut(),
-        dstPitch: surf_pitch as usize,
-        WidthInBytes: surf_w as usize,
-        Height: (surf_h / 2) as usize,
-    };
-    // SAFETY: Same invariants as Y; UV host range is offsets[1]..data_size,
-    // UV device range starts at cu_ptr + surf_pitch * surf_h (NV12 layout).
-    let r = unsafe { cuMemcpy2D_v2(&uv_copy) };
-    if r != CUresult::CUDA_SUCCESS {
-        return Err(DriverError::OperationFailed("cuMemcpy2D_v2 UV plane"));
+    // SAFETY: validated contiguous NV12 rows fit in image.data_size and the
+    // live host buffer. The CUDA surface owns pitch * (height + height/2)
+    // bytes; its context is bound and input/output pitches cover the width.
+    if unsafe { cuMemcpy2D_v2(&copy) } != CUresult::CUDA_SUCCESS {
+        return Err(DriverError::OperationFailed("cuMemcpy2D_v2 NV12 image"));
     }
     Ok(())
 }
 
+/// Validate that a single pitched transfer spans both NV12 planes safely.
+fn nv12_upload_rows(image: &ImageRec) -> Result<usize, DriverError> {
+    let pitch = u64::from(image.pitches[0]);
+    let height = u64::from(image.height);
+    let rows = height + height / 2;
+    let y_size = pitch
+        .checked_mul(height)
+        .ok_or(DriverError::InvalidParameter)?;
+    let total = pitch
+        .checked_mul(rows)
+        .ok_or(DriverError::InvalidParameter)?;
+    if image.fourcc != va::VA_FOURCC_NV12
+        || image.width == 0
+        || image.height == 0
+        || image.width % 2 != 0
+        || image.height % 2 != 0
+        || pitch < u64::from(image.width)
+        || image.pitches[1] != image.pitches[0]
+        || image.offsets[0] != 0
+        || u64::from(image.offsets[1]) != y_size
+        || total > u64::from(image.data_size)
+    {
+        return Err(DriverError::InvalidParameter);
+    }
+    usize::try_from(rows).map_err(|_| DriverError::InvalidParameter)
+}
+
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    fn pitched_image() -> ImageRec {
+        ImageRec {
+            surface_key: None,
+            buffer_key: Default::default(),
+            fourcc: va::VA_FOURCC_NV12,
+            width: 854,
+            height: 480,
+            pitches: [864, 864, 0],
+            offsets: [0, 864 * 480, 0],
+            data_size: 864 * 720,
+        }
+    }
+
+    #[test]
+    fn combined_upload_includes_chroma_rows_with_padded_pitch() {
+        assert_eq!(nv12_upload_rows(&pitched_image()).unwrap(), 720);
+    }
+
+    #[test]
+    fn combined_upload_rejects_noncontiguous_or_out_of_bounds_planes() {
+        let base = pitched_image();
+        for (pitch, offset, size, height) in [
+            (848, base.offsets[1], base.data_size, 480),
+            (864, base.offsets[1] + 1, base.data_size, 480),
+            (864, base.offsets[1], base.data_size - 1, 480),
+            (864, base.offsets[1], base.data_size, 479),
+        ] {
+            let mut image = pitched_image();
+            image.pitches[1] = pitch;
+            image.offsets[1] = offset;
+            image.data_size = size;
+            image.height = height;
+            assert!(nv12_upload_rows(&image).is_err());
+        }
+    }
+
     #[test]
     fn nv12_pitch_math_matches_layout() {
         // Tightly-packed NV12 1280x720 should yield:

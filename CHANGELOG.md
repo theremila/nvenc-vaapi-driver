@@ -9,6 +9,10 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ### Changed
 
+- Upload contiguous NV12 image planes with one pitched CUDA transfer instead
+  of two, validating plane offsets, stride and allocation bounds first.
+- Allow the benchmark tool to select a driver directory for build comparisons.
+
 - Initialise NVENC lazily from actual H.264 parameters and apply dynamic rate
   control without forcing IDR for ordinary bitrate/framerate changes.
 - Load NVENC at runtime with explicit version/function validation; remove

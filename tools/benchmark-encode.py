@@ -20,7 +20,7 @@ def render_node() -> Path:
     raise RuntimeError("No NVIDIA render node; set NVENC_TEST_RENDER_NODE")
 
 
-def benchmark(mode: str, seconds: int, work: Path, pacing: str) -> dict:
+def benchmark(mode: str, seconds: int, work: Path, pacing: str, *, drivers_path: Path | None = None) -> dict:
     output = work / f"{mode}.h264"
     env = os.environ.copy()
     node = render_node()
@@ -29,7 +29,7 @@ def benchmark(mode: str, seconds: int, work: Path, pacing: str) -> dict:
     env["NVENC_VAAPI_DEVICE"] = pci
     args = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
     if mode == "vaapi":
-        drivers = Path(__file__).resolve().parent.parent / "target/release"
+        drivers = drivers_path or Path(__file__).resolve().parent.parent / "target/release"
         if not (drivers / "nvidia_nvenc_drv_video.so").exists():
             raise RuntimeError("Build release driver and run tools/run-vainfo.sh first")
         env.update(LIBVA_DRIVER_NAME="nvidia_nvenc", LIBVA_DRIVERS_PATH=str(drivers))
@@ -89,13 +89,14 @@ def main() -> None:
     parser.add_argument("--seconds", type=int, default=15)
     parser.add_argument("--pacing", choices=["real-time", "unlimited"], default="real-time")
     parser.add_argument("--mode", choices=["vaapi", "nvenc", "cpu", "all"], default="all")
+    parser.add_argument("--drivers-path", type=Path, help="VA-API driver directory for controlled build comparisons")
     options = parser.parse_args()
     if not 1 <= options.seconds <= 120:
         parser.error("--seconds must be between 1 and 120")
     modes = ["vaapi", "nvenc", "cpu"] if options.mode == "all" else [options.mode]
     with tempfile.TemporaryDirectory(prefix="nvenc-benchmark-") as folder:
         for mode in modes:
-            print(json.dumps(benchmark(mode, options.seconds, Path(folder), options.pacing)), flush=True)
+            print(json.dumps(benchmark(mode, options.seconds, Path(folder), options.pacing, drivers_path=options.drivers_path)), flush=True)
 
 
 if __name__ == "__main__":
