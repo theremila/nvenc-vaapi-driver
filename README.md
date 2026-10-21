@@ -9,6 +9,8 @@ There is no background daemon and no application-specific routing.
 - H.264 Constrained Baseline, Main and High; progressive NV12 input.
 - CBR, VBR and constant QP, dynamic bitrate and rational frame rate.
 - CUDA-resident input allocation and CPU upload through VA images.
+- NV12 image readback, including chroma-aligned crops, and explicit read/write
+  mapping access for internal CUDA surfaces.
 - Per-session input registration and synchronous, low-latency output without
   B-frames or lookahead.
 

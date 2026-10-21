@@ -38,9 +38,18 @@ registrations. Registrations belong to a session, so two contexts may share
 one surface safely. Surface destruction unregisters it from all sessions before
 freeing CUDA memory. Driver termination destroys contexts before surfaces.
 
-VA images use host memory for CPU upload. Mapping a generic buffer retains its
-storage lock until unmap. Mutating, rendering or destroying mapped buffers must
-be rejected before attempting to take that lock.
+VA images use a host shadow for CPU access. Read mappings of derived internal
+images download current pixels; write mappings upload on unmap. Write-only
+access skips readback, and read-only access skips upload. Legacy mapping means
+read/write. Standalone images use explicit get/put transfers. NV12 readback
+supports even-aligned rectangles without scaling; puts require full frames.
+Imported external surfaces do not support CPU image access.
+
+Mapping a generic buffer retains its storage lock until unmap. Mutating,
+rendering or destroying mapped buffers must be rejected before attempting to
+take that lock. Failed transfers leave the buffer unmapped. Get/put using an
+image derived from the same surface returns surface-busy; transfers involving
+a different derived surface synchronise its host shadow with device memory.
 
 ## Rate control and format limits
 

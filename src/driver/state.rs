@@ -234,14 +234,15 @@ pub struct BufferRec {
     /// Coded-segment header scratch; for EncCodedBufferType we hand back a
     /// VACodedBufferSegment chain written at the head of `storage`.
     pub coded_ready: Mutex<bool>,
-    pub mapped: Mutex<bool>,
+    /// Active map access flags; None means unmapped.
+    pub mapped: Mutex<Option<u32>>,
 }
 
 /// VA image record. Either a standalone `vaCreateImage` allocation
 /// (`surface_key = None`) or a derived image bound to a specific surface
 /// (`surface_key = Some`). In both cases the pixel bytes live in a generic
-/// buffer slot referenced by `buffer_key`; on `vaUnmapBuffer` of a derived
-/// image we trigger a host→device `cuMemcpy2D_v2` into the owning surface.
+/// buffer slot referenced by `buffer_key`. Read maps refresh a derived image
+/// from its surface; writable unmaps upload the host bytes to that surface.
 pub struct ImageRec {
     pub surface_key: Option<SurfaceKey>,
     pub fourcc: u32,

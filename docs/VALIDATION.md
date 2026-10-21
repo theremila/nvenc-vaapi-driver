@@ -27,6 +27,9 @@ Tests must fail when required tools or hardware are unavailable. Validate exact
 frame counts, visible dimensions, profile and full-stream decoding. Fractional
 frame rate is checked against SPS timing. ABI integration covers dynamic rate
 changes, shared input across contexts, stale IDs and live-resource termination.
+Image ABI tests compare full-frame and cropped NV12 readback byte for byte,
+exercise mapping access flags and copies between derived surfaces, and reject
+mapped buffers, invalid rectangles and stale surface handles.
 Increase `NVENC_TEST_FRAMES` for longer stability runs.
 
 ## Performance

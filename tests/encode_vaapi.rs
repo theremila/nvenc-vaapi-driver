@@ -295,3 +295,254 @@ fn dynamic_rate_control_two_contexts_and_surface_lifetime() {
         std::fs::remove_file(path).unwrap();
     }
 }
+
+#[test]
+#[ignore = "requires a live NVIDIA GPU and render node"]
+fn nv12_image_readback_crops_and_mapping_access() {
+    let mut d = Driver::new();
+    let ctx = &mut *d.ctx as *mut va::VADriverContext;
+    let mut surface = va::VA_INVALID_SURFACE;
+    let mut derived: va::VAImage = unsafe { std::mem::zeroed() };
+    let mut image: va::VAImage = unsafe { std::mem::zeroed() };
+    let mut format: va::VAImageFormat = unsafe { std::mem::zeroed() };
+    format.fourcc = va::VA_FOURCC_NV12;
+    // SAFETY: all output structs, buffers and rectangles are sized as passed.
+    unsafe {
+        assert_eq!(
+            d.vt.vaCreateSurfaces2.unwrap()(
+                ctx,
+                va::VA_RT_FORMAT_YUV420,
+                66,
+                34,
+                &mut surface,
+                1,
+                std::ptr::null_mut(),
+                0
+            ),
+            0
+        );
+        assert_eq!(d.vt.vaDeriveImage.unwrap()(ctx, surface, &mut derived), 0);
+        let mut ptr = std::ptr::null_mut();
+        assert_eq!(
+            d.vt.vaMapBuffer2.unwrap()(ctx, derived.buf, &mut ptr, 4),
+            va::VA_STATUS_ERROR_INVALID_PARAMETER as i32
+        );
+        assert_eq!(
+            d.vt.vaMapBuffer2.unwrap()(ctx, derived.buf, &mut ptr, va::VA_MAPBUFFER_FLAG_WRITE),
+            0
+        );
+        let bytes = std::slice::from_raw_parts_mut(ptr.cast::<u8>(), derived.data_size as usize);
+        bytes.fill(0xa5);
+        for plane in 0..2 {
+            let height = if plane == 0 { 34 } else { 17 };
+            for y in 0..height {
+                for x in 0..66 {
+                    bytes[derived.offsets[plane] as usize
+                        + y * derived.pitches[plane] as usize
+                        + x] = (x + 3 * y + 80 * plane) as u8;
+                }
+            }
+        }
+        assert_eq!(d.vt.vaUnmapBuffer.unwrap()(ctx, derived.buf), 0);
+        // A read map sees current device bytes; unmap must not upload them.
+        assert_eq!(
+            d.vt.vaMapBuffer2.unwrap()(ctx, derived.buf, &mut ptr, va::VA_MAPBUFFER_FLAG_READ),
+            0
+        );
+        assert_eq!(*ptr.cast::<u8>().add(5), 5);
+        // Deliberately modify the host shadow to detect an accidental upload.
+        *ptr.cast::<u8>().add(5) = 222;
+        assert_eq!(d.vt.vaUnmapBuffer.unwrap()(ctx, derived.buf), 0);
+        assert_eq!(d.vt.vaMapBuffer.unwrap()(ctx, derived.buf, &mut ptr), 0);
+        assert_eq!(*ptr.cast::<u8>().add(5), 5);
+        *ptr.cast::<u8>().add(5) = 111;
+        assert_eq!(d.vt.vaUnmapBuffer.unwrap()(ctx, derived.buf), 0);
+        assert_eq!(
+            d.vt.vaCreateImage.unwrap()(ctx, &mut format, 66, 34, &mut image),
+            0
+        );
+        assert_eq!(
+            d.vt.vaGetImage.unwrap()(ctx, surface, 0, 0, 66, 34, image.image_id),
+            0
+        );
+        assert_eq!(
+            d.vt.vaMapBuffer2.unwrap()(ctx, image.buf, &mut ptr, va::VA_MAPBUFFER_FLAG_READ),
+            0
+        );
+        let bytes = std::slice::from_raw_parts(ptr.cast::<u8>(), image.data_size as usize);
+        for plane in 0..2 {
+            let height = if plane == 0 { 34 } else { 17 };
+            for y in 0..height {
+                for x in 0..66 {
+                    let expected = if plane == 0 && y == 0 && x == 5 {
+                        111
+                    } else {
+                        (x + 3 * y + 80 * plane) as u8
+                    };
+                    assert_eq!(
+                        bytes
+                            [image.offsets[plane] as usize + y * image.pitches[plane] as usize + x],
+                        expected
+                    );
+                }
+            }
+        }
+        assert_ne!(
+            d.vt.vaGetImage.unwrap()(ctx, surface, 0, 0, 66, 34, image.image_id),
+            0
+        );
+        assert_eq!(d.vt.vaUnmapBuffer.unwrap()(ctx, image.buf), 0);
+        assert_eq!(d.vt.vaDestroyImage.unwrap()(ctx, image.image_id), 0);
+        assert_eq!(
+            d.vt.vaCreateImage.unwrap()(ctx, &mut format, 22, 12, &mut image),
+            0
+        );
+        assert_eq!(
+            d.vt.vaGetImage.unwrap()(ctx, surface, 8, 6, 22, 12, image.image_id),
+            0
+        );
+        assert_eq!(d.vt.vaMapBuffer.unwrap()(ctx, image.buf, &mut ptr), 0);
+        let bytes = std::slice::from_raw_parts(ptr.cast::<u8>(), image.data_size as usize);
+        for plane in 0..2 {
+            let height = if plane == 0 { 12 } else { 6 };
+            let source_y = if plane == 0 { 6 } else { 3 };
+            for y in 0..height {
+                for x in 0..22 {
+                    assert_eq!(
+                        bytes
+                            [image.offsets[plane] as usize + y * image.pitches[plane] as usize + x],
+                        (x + 8 + 3 * (y + source_y) + 80 * plane) as u8
+                    );
+                }
+            }
+        }
+        assert_eq!(d.vt.vaUnmapBuffer.unwrap()(ctx, image.buf), 0);
+        for (x, y, w, h) in [
+            (-2, 0, 22, 12),
+            (1, 0, 22, 12),
+            (0, 1, 22, 12),
+            (46, 0, 22, 12),
+            (0, 24, 22, 12),
+            (0, 0, 20, 12),
+        ] {
+            assert_eq!(
+                d.vt.vaGetImage.unwrap()(ctx, surface, x, y, w, h, image.image_id),
+                va::VA_STATUS_ERROR_INVALID_PARAMETER as i32
+            );
+        }
+        assert_eq!(
+            d.vt.vaGetImage.unwrap()(ctx, surface, 0, 0, 66, 34, derived.image_id),
+            va::VA_STATUS_ERROR_SURFACE_BUSY as i32
+        );
+        assert_eq!(
+            d.vt.vaPutImage.unwrap()(ctx, surface, derived.image_id, 0, 0, 66, 34, 0, 0, 66, 34),
+            va::VA_STATUS_ERROR_SURFACE_BUSY as i32
+        );
+        assert_eq!(d.vt.vaDestroyImage.unwrap()(ctx, image.image_id), 0);
+        assert_eq!(d.vt.vaDestroyImage.unwrap()(ctx, derived.image_id), 0);
+        // Reject invalid image sizes before allocating or inserting objects.
+        for (w, h) in [(3, 2), (2, 3), (65536, 2)] {
+            assert_eq!(
+                d.vt.vaCreateImage.unwrap()(ctx, &mut format, w, h, &mut image),
+                va::VA_STATUS_ERROR_INVALID_PARAMETER as i32
+            );
+        }
+        assert_eq!(d.vt.vaDestroySurfaces.unwrap()(ctx, &mut surface, 1), 0);
+    }
+}
+
+#[test]
+#[ignore = "requires a live NVIDIA GPU and render node"]
+fn derived_images_copy_between_surfaces_and_reject_stale_surface() {
+    let mut d = Driver::new();
+    let ctx = &mut *d.ctx as *mut va::VADriverContext;
+    let mut surfaces = [va::VA_INVALID_SURFACE; 2];
+    let mut images: [va::VAImage; 2] = unsafe { std::mem::zeroed() };
+    // SAFETY: arrays and image buffers remain live and are sized as passed.
+    unsafe {
+        assert_eq!(
+            d.vt.vaCreateSurfaces2.unwrap()(
+                ctx,
+                va::VA_RT_FORMAT_YUV420,
+                66,
+                34,
+                surfaces.as_mut_ptr(),
+                2,
+                std::ptr::null_mut(),
+                0
+            ),
+            0
+        );
+        let mut ptr = std::ptr::null_mut();
+        for i in 0..2 {
+            assert_eq!(
+                d.vt.vaDeriveImage.unwrap()(ctx, surfaces[i], &mut images[i]),
+                0
+            );
+            assert_eq!(
+                d.vt.vaMapBuffer2.unwrap()(
+                    ctx,
+                    images[i].buf,
+                    &mut ptr,
+                    va::VA_MAPBUFFER_FLAG_WRITE
+                ),
+                0
+            );
+            std::slice::from_raw_parts_mut(ptr.cast::<u8>(), images[i].data_size as usize)
+                .fill(40 + i as u8);
+            assert_eq!(d.vt.vaUnmapBuffer.unwrap()(ctx, images[i].buf), 0);
+        }
+        assert_eq!(
+            d.vt.vaGetImage.unwrap()(ctx, surfaces[0], 0, 0, 66, 34, images[1].image_id),
+            0
+        );
+        assert_eq!(
+            d.vt.vaMapBuffer2.unwrap()(ctx, images[1].buf, &mut ptr, va::VA_MAPBUFFER_FLAG_READ),
+            0
+        );
+        assert_eq!(*ptr.cast::<u8>(), 40);
+        // Leave a stale host shadow; vaPutImage must read the derived surface.
+        *ptr.cast::<u8>() = 200;
+        assert_eq!(d.vt.vaUnmapBuffer.unwrap()(ctx, images[1].buf), 0);
+        assert_eq!(
+            d.vt.vaMapBuffer2.unwrap()(ctx, images[0].buf, &mut ptr, va::VA_MAPBUFFER_FLAG_WRITE),
+            0
+        );
+        std::slice::from_raw_parts_mut(ptr.cast::<u8>(), images[0].data_size as usize).fill(60);
+        assert_eq!(d.vt.vaUnmapBuffer.unwrap()(ctx, images[0].buf), 0);
+        assert_eq!(
+            d.vt.vaPutImage.unwrap()(
+                ctx,
+                surfaces[0],
+                images[1].image_id,
+                0,
+                0,
+                66,
+                34,
+                0,
+                0,
+                66,
+                34
+            ),
+            0
+        );
+        assert_eq!(
+            d.vt.vaMapBuffer2.unwrap()(ctx, images[0].buf, &mut ptr, va::VA_MAPBUFFER_FLAG_READ),
+            0
+        );
+        assert_eq!(*ptr.cast::<u8>(), 40);
+        assert_eq!(d.vt.vaUnmapBuffer.unwrap()(ctx, images[0].buf), 0);
+        assert_eq!(
+            d.vt.vaDestroySurfaces.unwrap()(ctx, surfaces.as_mut_ptr(), 2),
+            0
+        );
+        assert_eq!(
+            d.vt.vaMapBuffer2.unwrap()(ctx, images[0].buf, &mut ptr, va::VA_MAPBUFFER_FLAG_READ),
+            va::VA_STATUS_ERROR_INVALID_SURFACE as i32
+        );
+        // A failed read leaves the buffer unmapped and destroyable.
+        for image in images {
+            assert_eq!(d.vt.vaDestroyImage.unwrap()(ctx, image.image_id), 0);
+        }
+    }
+}

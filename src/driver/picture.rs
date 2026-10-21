@@ -81,7 +81,7 @@ pub unsafe extern "C" fn render_picture(
             let brec = &pools.buffers[bk];
             // Map retains the generic storage mutex until unmap. Checking
             // first avoids deadlocking the display on a malformed submission.
-            if *brec.mapped.lock() {
+            if brec.mapped.lock().is_some() {
                 return Err(DriverError::InvalidParameter);
             }
             if brec.buf_type == va::VAEncCodedBufferType {
@@ -244,7 +244,7 @@ pub unsafe extern "C" fn end_picture(
             .buffers
             .get(cb_key)
             .ok_or(DriverError::InvalidBuffer)?;
-        if *buf.mapped.lock() {
+        if buf.mapped.lock().is_some() {
             return Err(DriverError::InvalidParameter);
         }
         let BufferStorage::Coded(slot) = &buf.storage else {
@@ -643,6 +643,49 @@ mod tests {
     }
 
     #[test]
+    fn derive_rejects_surfaces_without_cpu_access() {
+        let mut f = Fixture::new();
+        let mut image: va::VAImage = unsafe { core::mem::zeroed() };
+        assert_eq!(
+            unsafe { crate::driver::image::derive_image(&mut *f.ctx, f.surface, &mut image) },
+            va::VA_STATUS_ERROR_OPERATION_FAILED as i32
+        );
+        assert_eq!(f.state.pools.lock().images.iter().count(), 0);
+    }
+
+    #[test]
+    fn map_access_flags_reject_unknown_bits_without_poisoning_mapping() {
+        let mut f = Fixture::new();
+        let id = f.buffer(va::VAImageBufferType, &[7; 64]);
+        let mut mapped = ptr::null_mut();
+        for flags in [4, u32::MAX] {
+            assert_eq!(
+                unsafe { buffer::map_buffer2(&mut *f.ctx, id, &mut mapped, flags) },
+                va::VA_STATUS_ERROR_INVALID_PARAMETER as i32
+            );
+            assert!(mapped.is_null());
+        }
+        for flags in [
+            va::VA_MAPBUFFER_FLAG_DEFAULT,
+            va::VA_MAPBUFFER_FLAG_READ,
+            va::VA_MAPBUFFER_FLAG_WRITE,
+            va::VA_MAPBUFFER_FLAG_READ | va::VA_MAPBUFFER_FLAG_WRITE,
+        ] {
+            assert_eq!(
+                unsafe { buffer::map_buffer2(&mut *f.ctx, id, &mut mapped, flags) },
+                0
+            );
+            assert_eq!(unsafe { *mapped.cast::<u8>() }, 7);
+            assert_eq!(
+                unsafe { buffer::destroy_buffer(&mut *f.ctx, id) },
+                va::VA_STATUS_ERROR_INVALID_PARAMETER as i32
+            );
+            assert_eq!(unsafe { buffer::unmap_buffer(&mut *f.ctx, id) }, 0);
+        }
+        assert_eq!(unsafe { buffer::destroy_buffer(&mut *f.ctx, id) }, 0);
+    }
+
+    #[test]
     fn derived_image_unmap_releases_mapping_guard_before_upload_validation() {
         let mut f = Fixture::new();
         let id = f.buffer(va::VAImageBufferType, &[0; 64]);
@@ -666,10 +709,15 @@ mod tests {
         }
         let mut mapped = ptr::null_mut();
         assert_eq!(
-            unsafe { buffer::map_buffer(&mut *f.ctx, id, &mut mapped) },
+            unsafe {
+                buffer::map_buffer2(&mut *f.ctx, id, &mut mapped, va::VA_MAPBUFFER_FLAG_WRITE)
+            },
             0
         );
-        assert_eq!(unsafe { buffer::unmap_buffer(&mut *f.ctx, id) }, 0);
+        assert_eq!(
+            unsafe { buffer::unmap_buffer(&mut *f.ctx, id) },
+            va::VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE as i32
+        );
         assert_eq!(unsafe { buffer::destroy_buffer(&mut *f.ctx, id) }, 0);
     }
 

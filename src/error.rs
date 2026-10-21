@@ -17,6 +17,9 @@ pub type VAStatus = va::VAStatus;
 /// tests so that accidental table drift is caught at compile-time.
 #[derive(Debug, Error)]
 pub enum DriverError {
+    #[error("surface is bound to the derived image")]
+    SurfaceBusy,
+
     /// A vtable slot is populated with a stub that returns this until the real
     /// implementation is wired in. Maps to `VA_STATUS_ERROR_UNIMPLEMENTED`.
     #[error("unimplemented vtable entry")]
@@ -104,6 +107,7 @@ pub enum DriverError {
 impl DriverError {
     pub const fn to_status(&self) -> VAStatus {
         match self {
+            DriverError::SurfaceBusy => va::VA_STATUS_ERROR_SURFACE_BUSY as VAStatus,
             DriverError::Unimplemented => va::VA_STATUS_ERROR_UNIMPLEMENTED as VAStatus,
             DriverError::InvalidConfig => va::VA_STATUS_ERROR_INVALID_CONFIG as VAStatus,
             DriverError::InvalidContext => va::VA_STATUS_ERROR_INVALID_CONTEXT as VAStatus,
@@ -149,6 +153,7 @@ mod tests {
         // DriverError -> VAStatus mapping by accident, this test fails with a
         // precise variant name. Keep in sync with the impl.
         let cases: &[(DriverError, u32)] = &[
+            (DriverError::SurfaceBusy,          va::VA_STATUS_ERROR_SURFACE_BUSY),
             (DriverError::Unimplemented,        va::VA_STATUS_ERROR_UNIMPLEMENTED),
             (DriverError::InvalidConfig,        va::VA_STATUS_ERROR_INVALID_CONFIG),
             (DriverError::InvalidContext,       va::VA_STATUS_ERROR_INVALID_CONTEXT),
@@ -180,6 +185,7 @@ mod tests {
     fn every_error_status_is_nonzero_and_distinct_from_success() {
         // Any error variant must not collide with VA_STATUS_SUCCESS (0).
         let variants = [
+            DriverError::SurfaceBusy,
             DriverError::Unimplemented,
             DriverError::InvalidConfig,
             DriverError::InvalidContext,

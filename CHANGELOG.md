@@ -24,6 +24,11 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ### Fixed
 
+- Download current pixels when mapping derived NV12 images for reading;
+  honour read/write mapping flags and reject unknown access bits.
+- Reject unsupported CPU image access instead of silently skipping uploads,
+  and validate image dimensions before allocating objects.
+
 - Preserve rational frame rates and visible dimensions after H.264 cropping.
 - Keep VBR average and peak bitrate separate and honour constant-QP input.
 - Never reuse public object IDs; reject stale handles after destruction.
@@ -35,6 +40,9 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 - Stop advertising packed-header passthrough that is not implemented.
 
 ### Added
+
+- NV12 image readback with chroma-aligned cropping and regression coverage
+  for mapping access, copies between surfaces and stale surface handles.
 
 - Regression coverage for ABI lifecycle, dynamic rate control, shared inputs,
   full-stream decoding, installation and runtime API loading.
