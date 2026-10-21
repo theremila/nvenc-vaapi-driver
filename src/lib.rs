@@ -59,6 +59,7 @@ mod h264;
 mod ids;
 mod logging;
 mod nvenc;
+mod profiling;
 
 use crate::driver::DriverState;
 use crate::error::{VA_STATUS_SUCCESS, VA_STATUS_UNKNOWN, VAStatus};
@@ -211,6 +212,8 @@ unsafe extern "C" fn terminate(ctx: va::VADriverContextP) -> VAStatus {
             // SAFETY: pDriverData came from Box::into_raw in driver_init.
             drop(Box::from_raw(p));
             (*ctx).pDriverData = core::ptr::null_mut();
+            #[cfg(feature = "profiling")]
+            crate::profiling::report();
         }
         VA_STATUS_SUCCESS
     })) {

@@ -79,28 +79,37 @@ impl NvencSession {
             H264Profile::High => nv::NV_ENC_H264_PROFILE_HIGH_GUID,
         };
 
-        // 3. Fetch preset-default NV_ENC_CONFIG and mutate it in-place.
-        //    MaybeUninit::zeroed is correct because every field is either
-        //    u32/enum/POD or will be overwritten by GetEncodePresetConfigEx.
-        let mut preset_cfg: nv::NV_ENC_PRESET_CONFIG =
-            unsafe { MaybeUninit::zeroed().assume_init() };
-        preset_cfg.version = nv::NV_ENC_PRESET_CONFIG_VER;
-        preset_cfg.presetCfg.version = nv::NV_ENC_CONFIG_VER;
-        // SAFETY: encoder valid (just opened), preset_cfg is a fresh struct.
+        // The SDK bindings use Rust enums that cannot represent zero for
+        // frameFieldMode. Keep C output as raw storage until it is normalised.
+        let mut preset_storage = MaybeUninit::<nv::NV_ENC_PRESET_CONFIG>::zeroed();
+        let preset_ptr = preset_storage.as_mut_ptr();
+        // SAFETY: writable storage; only integer fields are initialised here.
+        unsafe {
+            core::ptr::addr_of_mut!((*preset_ptr).version).write(nv::NV_ENC_PRESET_CONFIG_VER);
+            core::ptr::addr_of_mut!((*preset_ptr).presetCfg.version).write(nv::NV_ENC_CONFIG_VER);
+        }
+        // SAFETY: versioned output storage, live encoder, H.264 codec.
         let status = unsafe {
             (api.get_encode_preset_config_ex)(
                 encoder,
                 nv::NV_ENC_CODEC_H264_GUID,
                 preset_guid,
                 tuning,
-                &mut preset_cfg,
+                preset_ptr,
             )
         };
         if status != nv::NVENCSTATUS::NV_ENC_SUCCESS {
-            // SAFETY: encoder valid.
+            // SAFETY: encoder is live and has no pending work.
             unsafe { (api.destroy_encoder)(encoder) };
             return Err(DriverError::OperationFailed("NvEncGetEncodePresetConfigEx"));
         }
+        // SAFETY: successful H.264 preset output; normalise the only nested
+        // nonzero Rust enum before forming a typed value (progressive only).
+        let mut preset_cfg = unsafe {
+            core::ptr::addr_of_mut!((*preset_ptr).presetCfg.frameFieldMode)
+                .write(nv::NV_ENC_PARAMS_FRAME_FIELD_MODE::NV_ENC_PARAMS_FRAME_FIELD_MODE_FRAME);
+            preset_storage.assume_init()
+        };
 
         // Apply our project-specific config on top of the preset default.
         h264_config::apply_config(&mut preset_cfg.presetCfg, &cfg);
@@ -161,12 +170,12 @@ impl NvencSession {
         width: u32,
         height: u32,
     ) -> Result<(), DriverError> {
-        self._cuda_ctx
-            .bind_to_thread()
-            .map_err(|_| DriverError::OperationFailed("cuda bind_to_thread"))?;
         if self.registered.contains_key(&key) {
             return Ok(());
         }
+        self._cuda_ctx
+            .bind_to_thread()
+            .map_err(|_| DriverError::OperationFailed("cuda bind_to_thread"))?;
         let api = api::get()?;
         let mut params: nv::NV_ENC_REGISTER_RESOURCE =
             unsafe { MaybeUninit::zeroed().assume_init() };
@@ -211,12 +220,12 @@ impl NvencSession {
         width: u32,
         height: u32,
     ) -> Result<nv::NV_ENC_REGISTERED_PTR, DriverError> {
-        self._cuda_ctx
-            .bind_to_thread()
-            .map_err(|_| DriverError::OperationFailed("cuda bind_to_thread"))?;
         if let Some(existing) = self.registered.get(&key) {
             return Ok(existing.registered_ptr);
         }
+        self._cuda_ctx
+            .bind_to_thread()
+            .map_err(|_| DriverError::OperationFailed("cuda bind_to_thread"))?;
         let api = api::get()?;
         let mut params: nv::NV_ENC_REGISTER_RESOURCE =
             unsafe { MaybeUninit::zeroed().assume_init() };
@@ -296,8 +305,9 @@ impl NvencSession {
         map.version = nv::NV_ENC_MAP_INPUT_RESOURCE_VER;
         map.registeredResource = reg.registered_ptr;
         // SAFETY: registered resource belongs to this live encoder.
-        if unsafe { (api.map_input_resource)(self.encoder, &mut map) }
-            != nv::NVENCSTATUS::NV_ENC_SUCCESS
+        if crate::profiling::timed!(InputMap, unsafe {
+            (api.map_input_resource)(self.encoder, &mut map)
+        }) != nv::NVENCSTATUS::NV_ENC_SUCCESS
         {
             return Err(DriverError::OperationFailed("NvEncMapInputResource"));
         }
@@ -311,7 +321,9 @@ impl NvencSession {
             force_idr,
         );
         // SAFETY: all resources remain live until lock/unmap completes.
-        let status = unsafe { (api.encode_picture)(self.encoder, &mut pic) };
+        let status = crate::profiling::timed!(Submit, unsafe {
+            (api.encode_picture)(self.encoder, &mut pic)
+        });
         let result = if status == nv::NVENCSTATUS::NV_ENC_SUCCESS {
             self.lock_and_copy(api, handle, output)
         } else {
@@ -320,7 +332,9 @@ impl NvencSession {
             ))
         };
         // SAFETY: paired with the successful map, including error paths.
-        let unmap = unsafe { (api.unmap_input_resource)(self.encoder, map.mappedResource) };
+        let unmap = crate::profiling::timed!(InputUnmap, unsafe {
+            (api.unmap_input_resource)(self.encoder, map.mappedResource)
+        });
         result?;
         if unmap != nv::NVENCSTATUS::NV_ENC_SUCCESS {
             return Err(DriverError::OperationFailed("NvEncUnmapInputResource"));
@@ -343,12 +357,12 @@ impl NvencSession {
         new_cfg: EncoderConfig,
         force_idr: bool,
     ) -> Result<(), DriverError> {
-        self._cuda_ctx
-            .bind_to_thread()
-            .map_err(|_| DriverError::OperationFailed("cuda bind_to_thread"))?;
         if new_cfg == self.config {
             return Ok(());
         }
+        self._cuda_ctx
+            .bind_to_thread()
+            .map_err(|_| DriverError::OperationFailed("cuda bind_to_thread"))?;
         let api = api::get()?;
 
         // Preserve the successful preset configuration. A bitrate update
@@ -388,17 +402,28 @@ impl NvencSession {
         slot_handle: nv::NV_ENC_OUTPUT_PTR,
         data: &mut Vec<u8>,
     ) -> Result<(), DriverError> {
-        let mut lock: nv::NV_ENC_LOCK_BITSTREAM = unsafe { MaybeUninit::zeroed().assume_init() };
-        lock.version = nv::NV_ENC_LOCK_BITSTREAM_VER;
-        lock.outputBitstream = slot_handle;
+        // Output-only enum fields may be zero; never form an invalid Rust enum.
+        let mut storage = MaybeUninit::<nv::NV_ENC_LOCK_BITSTREAM>::zeroed();
+        let lock = storage.as_mut_ptr();
+        // SAFETY: writable C storage; no typed value is created.
+        unsafe {
+            core::ptr::addr_of_mut!((*lock).version).write(nv::NV_ENC_LOCK_BITSTREAM_VER);
+            core::ptr::addr_of_mut!((*lock).outputBitstream).write(slot_handle);
+        }
         // SAFETY: encoder valid, slot_handle from CreateBitstreamBuffer.
-        let s = unsafe { (api.lock_bitstream)(self.encoder, &mut lock) };
+        let s = crate::profiling::timed!(Lock, unsafe { (api.lock_bitstream)(self.encoder, lock) });
         if s != nv::NVENCSTATUS::NV_ENC_SUCCESS {
             return Err(DriverError::Encoding("NvEncLockBitstream"));
         }
-        let len = lock.bitstreamSizeInBytes as usize;
+        // SAFETY: successful SDK output; read only the initialised scalar fields.
+        let (len, bytes) = unsafe {
+            (
+                core::ptr::addr_of!((*lock).bitstreamSizeInBytes).read() as usize,
+                core::ptr::addr_of!((*lock).bitstreamBufferPtr).read(),
+            )
+        };
         let result = (|| {
-            if len == 0 || lock.bitstreamBufferPtr.is_null() {
+            if len == 0 || bytes.is_null() {
                 return Err(DriverError::Encoding("NVENC returned an empty picture"));
             }
             // Reuse the VA coded buffer allocation across frames. Only
@@ -408,14 +433,10 @@ impl NvencSession {
                 .map_err(|_| DriverError::AllocFailed)?;
             // SAFETY: NVENC returned a non-null, locked buffer of len bytes;
             // the destination has capacity for exactly those bytes.
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    lock.bitstreamBufferPtr.cast::<u8>(),
-                    data.as_mut_ptr(),
-                    len,
-                );
+            crate::profiling::timed!(BitstreamCopy, unsafe {
+                core::ptr::copy_nonoverlapping(bytes.cast::<u8>(), data.as_mut_ptr(), len);
                 data.set_len(len);
-            }
+            });
             Ok(())
         })();
         // SAFETY: paired with a successful lock, also on allocation failure.
@@ -436,6 +457,9 @@ impl Drop for NvencSession {
         let Ok(api) = api::get() else {
             return;
         };
+        let mut eos = eos_params();
+        // SAFETY: synchronous outputs are complete; flush before releasing resources.
+        unsafe { (api.encode_picture)(self.encoder, eos.as_mut_ptr()) };
         // SAFETY: bitstream came from this encoder and is not locked.
         unsafe { (api.destroy_bitstream_buffer)(self.encoder, self.bitstream) };
         // Unregister all surfaces.
@@ -451,6 +475,18 @@ impl Drop for NvencSession {
 
 // -------- helpers (VER population lives in one place so future version bumps
 // are a single-line change each) --------
+
+fn eos_params() -> MaybeUninit<nv::NV_ENC_PIC_PARAMS> {
+    let mut storage = MaybeUninit::<nv::NV_ENC_PIC_PARAMS>::zeroed();
+    // SAFETY: EOS is a C descriptor whose pictureStruct must remain zero.
+    // Zero is invalid for that Rust enum, so never assume_init this storage.
+    unsafe {
+        core::ptr::addr_of_mut!((*storage.as_mut_ptr()).version).write(nv::NV_ENC_PIC_PARAMS_VER);
+        core::ptr::addr_of_mut!((*storage.as_mut_ptr()).encodePicFlags)
+            .write(nv::NV_ENC_PIC_FLAGS::NV_ENC_PIC_FLAG_EOS as u32);
+    }
+    storage
+}
 
 fn open_session_ex_params(device: *mut c_void) -> nv::NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS {
     // SAFETY: struct is POD; zero is a valid bit pattern for every field.
@@ -496,8 +532,14 @@ fn pic_params(
     output_buf: nv::NV_ENC_OUTPUT_PTR,
     force_idr: bool,
 ) -> nv::NV_ENC_PIC_PARAMS {
-    // SAFETY: POD with zeroed-init; we fill the fields we care about.
-    let mut p: nv::NV_ENC_PIC_PARAMS = unsafe { MaybeUninit::zeroed().assume_init() };
+    let mut storage = MaybeUninit::<nv::NV_ENC_PIC_PARAMS>::zeroed();
+    // SAFETY: pictureStruct is the only nonzero Rust enum in this descriptor.
+    // Initialise it before forming a Rust value; other zero fields are valid.
+    let mut p = unsafe {
+        core::ptr::addr_of_mut!((*storage.as_mut_ptr()).pictureStruct)
+            .write(nv::NV_ENC_PIC_STRUCT::NV_ENC_PIC_STRUCT_FRAME);
+        storage.assume_init()
+    };
     p.version = nv::NV_ENC_PIC_PARAMS_VER;
     p.inputWidth = width;
     p.inputHeight = height;
@@ -544,6 +586,44 @@ mod tests {
     use super::*;
 
     // Pure-logic helpers we can test without a GPU.
+
+    #[test]
+    fn picture_descriptors_initialise_nonzero_enums_and_eos_flags() {
+        let pic = pic_params(
+            128,
+            64,
+            128,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+            true,
+        );
+        assert_eq!(pic.version, nv::NV_ENC_PIC_PARAMS_VER);
+        assert_eq!(
+            pic.pictureStruct,
+            nv::NV_ENC_PIC_STRUCT::NV_ENC_PIC_STRUCT_FRAME
+        );
+        assert_eq!(
+            pic.encodePicFlags,
+            nv::NV_ENC_PIC_FLAGS::NV_ENC_PIC_FLAG_FORCEIDR as u32
+        );
+        let eos = eos_params();
+        // SAFETY: read scalar members of initialised raw C storage, never its enum.
+        unsafe {
+            assert_eq!(
+                core::ptr::addr_of!((*eos.as_ptr()).version).read(),
+                nv::NV_ENC_PIC_PARAMS_VER
+            );
+            assert_eq!(
+                core::ptr::addr_of!((*eos.as_ptr()).encodePicFlags).read(),
+                nv::NV_ENC_PIC_FLAGS::NV_ENC_PIC_FLAG_EOS as u32
+            );
+            assert!(
+                core::ptr::addr_of!((*eos.as_ptr()).inputBuffer)
+                    .read()
+                    .is_null()
+            );
+        }
+    }
 
     #[test]
     fn map_preset_choice_p4_for_5mbps_60fps() {

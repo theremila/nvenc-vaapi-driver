@@ -124,7 +124,9 @@ pub unsafe extern "C" fn destroy_image(
         let rec = pools.images.remove(ik).ok_or(DriverError::InvalidImage)?;
         // Best-effort: also drop the backing data buffer. If the client
         // already destroyed it separately this is a no-op.
-        pools.buffers.remove(rec.buffer_key);
+        if let Some(buffer) = pools.buffers.remove(rec.buffer_key) {
+            recycle_image_buffer(&mut pools, buffer);
+        }
         Ok(())
     })
 }
@@ -375,6 +377,8 @@ fn alloc_host_image(
     pitch: u32,
     fourcc: u32,
 ) -> Result<(va::VAImage, BufferKey, ImageKey), DriverError> {
+    #[cfg(feature = "profiling")]
+    let _span = crate::profiling::Span::new(crate::profiling::Phase::HostImage);
     debug_assert_eq!(fourcc, va::VA_FOURCC_NV12);
     let image_width = u16::try_from(width).map_err(|_| DriverError::InvalidParameter)?;
     let image_height = u16::try_from(height).map_err(|_| DriverError::InvalidParameter)?;
@@ -392,9 +396,15 @@ fn alloc_host_image(
         .ok_or(DriverError::InvalidParameter)?;
 
     let total_u32 = u32::try_from(total).map_err(|_| DriverError::InvalidParameter)?;
-    let mut bytes: Vec<u8> = Vec::new();
+    let mut bytes = core::mem::take(&mut state.pools.lock().image_bytes_cache);
+    // Standalone images start clear. Derived images refresh visible pixels
+    // on read maps; write-only maps discard them, so cached initialized bytes
+    // can be reused without clearing a full frame. New bytes are always zeroed.
+    if surface_key.is_none() {
+        bytes.clear();
+    }
     bytes
-        .try_reserve_exact(total)
+        .try_reserve_exact(total.saturating_sub(bytes.len()))
         .map_err(|_| DriverError::AllocFailed)?;
     bytes.resize(total, 0);
 
@@ -459,6 +469,22 @@ fn alloc_host_image(
         va_reserved: [0; 4],
     };
     Ok((image, bk, ik))
+}
+
+/// Retain at most one unmapped image allocation per display, up to 16 MiB.
+/// Coded/parameter buffers and oversized images keep their ordinary lifetime.
+pub(crate) fn recycle_image_buffer(pools: &mut Pools, buffer: BufferRec) {
+    if buffer.buf_type != va::VAImageBufferType {
+        return;
+    }
+    if let BufferStorage::Generic(bytes) = buffer.storage {
+        let bytes = bytes.into_inner();
+        if bytes.capacity() <= 16 * 1024 * 1024
+            && bytes.capacity() > pools.image_bytes_cache.capacity()
+        {
+            pools.image_bytes_cache = bytes;
+        }
+    }
 }
 
 /// Trigger `cuMemcpy2D_v2` host → device for all planes of an NV12 image
@@ -538,7 +564,7 @@ pub(crate) fn upload_image_to_surface(
     // SAFETY: validated contiguous NV12 rows fit in image.data_size and the
     // live host buffer. The CUDA surface owns pitch * (height + height/2)
     // bytes; its context is bound and input/output pitches cover the width.
-    if unsafe { cuMemcpy2D_v2(&copy) } != CUresult::CUDA_SUCCESS {
+    if crate::profiling::timed!(Upload, unsafe { cuMemcpy2D_v2(&copy) }) != CUresult::CUDA_SUCCESS {
         return Err(DriverError::OperationFailed("cuMemcpy2D_v2 NV12 image"));
     }
     Ok(())
@@ -624,7 +650,9 @@ pub(crate) fn download_image_from_surface(
         };
         // SAFETY: source region fits the live CUDA allocation; host layout and
         // lengths are validated above, and its CUDA context is current.
-        if unsafe { cuMemcpy2D_v2(&copy) } != CUresult::CUDA_SUCCESS {
+        if crate::profiling::timed!(Readback, unsafe { cuMemcpy2D_v2(&copy) })
+            != CUresult::CUDA_SUCCESS
+        {
             return Err(DriverError::OperationFailed("cuMemcpy2D_v2 NV12 readback"));
         }
     }

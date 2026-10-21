@@ -260,6 +260,8 @@ pub struct Pools {
     pub contexts: IdPool<ContextKey, ContextRec>,
     pub buffers: IdPool<BufferKey, BufferRec>,
     pub images: IdPool<ImageKey, ImageRec>,
+    /// One bounded, unmapped host allocation for subsequent image creation.
+    pub image_bytes_cache: Vec<u8>,
 }
 
 impl Pools {
@@ -270,6 +272,7 @@ impl Pools {
             contexts: IdPool::with_key(),
             buffers: IdPool::with_key(),
             images: IdPool::with_key(),
+            image_bytes_cache: Vec::new(),
         }
     }
 }

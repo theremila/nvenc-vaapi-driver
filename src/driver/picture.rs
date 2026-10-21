@@ -197,6 +197,8 @@ pub unsafe extern "C" fn end_picture(
     ctx: va::VADriverContextP,
     context: va::VAContextID,
 ) -> VAStatus {
+    #[cfg(feature = "profiling")]
+    let _span = crate::profiling::Span::new(crate::profiling::Phase::EndPicture);
     guard(|| {
         // SAFETY: ctx valid.
         let state = unsafe { state_from(ctx) }.ok_or(DriverError::InvalidParameter)?;
@@ -640,6 +642,70 @@ mod tests {
             0
         );
         assert!(mapped.is_null());
+    }
+
+    #[test]
+    fn image_storage_reuse_is_bounded_and_clears_previous_pixels() {
+        let mut f = Fixture::new();
+        let mut format: va::VAImageFormat = unsafe { core::mem::zeroed() };
+        format.fourcc = va::VA_FOURCC_NV12;
+        let mut image: va::VAImage = unsafe { core::mem::zeroed() };
+        let mut ptr = ptr::null_mut();
+        // SAFETY: image structs and mapped storage remain live until unmap.
+        unsafe {
+            assert_eq!(
+                crate::driver::image::create_image(
+                    &mut *f.ctx,
+                    &mut format,
+                    1024,
+                    1024,
+                    &mut image
+                ),
+                0
+            );
+            assert_eq!(buffer::map_buffer(&mut *f.ctx, image.buf, &mut ptr), 0);
+            let previous_address = ptr as usize;
+            core::slice::from_raw_parts_mut(ptr.cast::<u8>(), image.data_size as usize).fill(0xa5);
+            assert_eq!(buffer::unmap_buffer(&mut *f.ctx, image.buf), 0);
+            assert_eq!(
+                crate::driver::image::destroy_image(&mut *f.ctx, image.image_id),
+                0
+            );
+            assert_eq!(
+                crate::driver::image::create_image(&mut *f.ctx, &mut format, 64, 64, &mut image),
+                0
+            );
+            assert_eq!(buffer::map_buffer(&mut *f.ctx, image.buf, &mut ptr), 0);
+            assert_eq!(ptr as usize, previous_address);
+            assert!(
+                core::slice::from_raw_parts(ptr.cast::<u8>(), image.data_size as usize)
+                    .iter()
+                    .all(|&b| b == 0)
+            );
+            assert_eq!(buffer::unmap_buffer(&mut *f.ctx, image.buf), 0);
+            // Clients may destroy an image buffer directly before its image.
+            assert_eq!(buffer::destroy_buffer(&mut *f.ctx, image.buf), 0);
+            assert_eq!(
+                crate::driver::image::destroy_image(&mut *f.ctx, image.image_id),
+                0
+            );
+            // An oversized image must not grow the retained cache.
+            assert_eq!(
+                crate::driver::image::create_image(
+                    &mut *f.ctx,
+                    &mut format,
+                    4096,
+                    4096,
+                    &mut image
+                ),
+                0
+            );
+            assert_eq!(
+                crate::driver::image::destroy_image(&mut *f.ctx, image.image_id),
+                0
+            );
+        }
+        assert!(f.state.pools.lock().image_bytes_cache.capacity() <= 16 * 1024 * 1024);
     }
 
     #[test]

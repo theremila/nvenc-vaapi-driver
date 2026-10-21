@@ -229,7 +229,9 @@ pub unsafe extern "C" fn destroy_buffer(
         if pools.buffers[k].mapped.lock().is_some() {
             return Err(DriverError::InvalidParameter);
         }
-        pools.buffers.remove(k);
+        if let Some(buffer) = pools.buffers.remove(k) {
+            crate::driver::image::recycle_image_buffer(&mut pools, buffer);
+        }
         Ok(())
     })
 }

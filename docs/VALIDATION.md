@@ -3,8 +3,8 @@
 ## CPU and ABI checks
 
 ```sh
-cargo test --locked --all-targets
-cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked --all-targets --all-features
+cargo clippy --locked --all-targets --all-features -- -D warnings
 git diff --check
 python3 -m unittest discover -s tools/tests -v
 ```
@@ -50,6 +50,21 @@ work invalidate comparisons made under different conditions.
 
 Do not infer minimum energy use from GPU utilization alone. Keep raw results
 outside tracked documentation, for example under `target/validation/`.
+
+## Stage profiling
+
+Build with
+`cargo build --release --features profiling --target-dir target/profiling`
+to enable process-wide timing counters. Create the usual libva symlink in that release
+directory, then pass it to the benchmark with `--drivers-path`. On termination
+the driver writes `nvenc-vaapi-profile` counters to stderr: call counts and
+aggregate nanoseconds for host images, CUDA copies and NVENC operations.
+These counters contain no device identity or image data.
+
+Timings include CPU waiting and are not GPU kernel timings. End-picture time
+includes its nested stages; do not sum them together. Counters accumulate
+across displays in the process. Ordinary builds compile out the timers and
+atomic counters. Use ordinary builds for final throughput comparisons.
 
 ## Client release checks
 

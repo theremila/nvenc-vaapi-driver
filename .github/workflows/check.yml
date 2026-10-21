@@ -17,9 +17,9 @@ jobs:
           rustup default stable
           rustup component add clippy
       - name: CPU and shared-library ABI regressions
-        run: cargo test --locked --all-targets
+        run: cargo test --locked --all-targets --all-features
       - name: Clippy
-        run: cargo clippy --locked --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - name: Installer regressions
         run: python3 -m unittest discover -s tools/tests -v
       - name: Whitespace

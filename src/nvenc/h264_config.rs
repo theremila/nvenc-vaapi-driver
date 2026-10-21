@@ -7,10 +7,8 @@
 //! GOP, RC-параметри та VUI. Поля, не згадані тут (тюнінг-hint-и, резерв,
 //! matrix-коефіцієнти окрім VUI), лишаються такими, як виставив preset.
 //!
-//! Тести у цьому файлі не викликають жодного FFI — preset-default
-//! емулюється через `MaybeUninit::zeroed()`, що безпечно для POD-структур
-//! NVENC. Реальний FFI-шлях (`nvEncGetEncodePresetConfigEx` → `apply_config`
-//! → `NvEncInitializeEncoder`) буде доданий у наступному slice (c.2).
+//! Tests use a synthetic config with valid Rust enum discriminants. Runtime
+//! sessions obtain preset defaults from NVENC before applying these overrides.
 
 use crate::nvenc::preset;
 use nvidia_video_codec_sdk::sys::nvEncodeAPI as nv;
@@ -212,10 +210,15 @@ mod tests {
     /// Preset-default емуляція: zero-filled NV_ENC_CONFIG.
     ///
     /// # Safety
-    /// NVENC-структури `#[repr(C)]`, всі поля — POD (u32 / enum з варіантом 0 /
-    /// вкладений union зі spare-варіантом). Zero — валідний біт-паттерн.
+    /// Initialise the nonzero frame-field enum before forming a Rust config.
     fn zeroed_preset() -> nv::NV_ENC_CONFIG {
-        unsafe { MaybeUninit::<nv::NV_ENC_CONFIG>::zeroed().assume_init() }
+        let mut storage = MaybeUninit::<nv::NV_ENC_CONFIG>::zeroed();
+        // SAFETY: initialise the only nonzero Rust enum before assuming init.
+        unsafe {
+            core::ptr::addr_of_mut!((*storage.as_mut_ptr()).frameFieldMode)
+                .write(nv::NV_ENC_PARAMS_FRAME_FIELD_MODE::NV_ENC_PARAMS_FRAME_FIELD_MODE_FRAME);
+            storage.assume_init()
+        }
     }
 
     fn default_1080p60_cbr() -> EncoderConfig {

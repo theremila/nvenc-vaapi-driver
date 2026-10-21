@@ -16,6 +16,9 @@ name = "nvidia_nvenc_drv_video"
 crate-type = ["cdylib"]
 path = "src/lib.rs"
 
+[features]
+profiling = []
+
 [dependencies]
 va-sys = { path = "crates/va-sys" }
 slotmap = "1"
