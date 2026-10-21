@@ -23,6 +23,8 @@ pub struct EncoderConfig {
     /// Derived frame rate (`time_scale / (num_units_in_tick * 2)`), rounded.
     /// Zero means "not derivable from the VUI timebase".
     pub fps: u32,
+    pub fps_num: u32,
+    pub fps_den: u32,
     /// Maximum number of reference frames the client asked for.
     pub max_num_ref_frames: u32,
     /// Decoded picture dimensions, in pixels (MB count × 16).
@@ -52,8 +54,12 @@ pub struct PicParams {
 pub fn parse_sps(bytes: &[u8]) -> Option<EncoderConfig> {
     let size = core::mem::size_of::<va::VAEncSequenceParameterBufferH264>();
     let align = core::mem::align_of::<va::VAEncSequenceParameterBufferH264>();
-    if bytes.len() < size { return None; }
-    if (bytes.as_ptr() as usize) % align != 0 { return None; }
+    if bytes.len() < size {
+        return None;
+    }
+    if bytes.as_ptr().align_offset(align) != 0 {
+        return None;
+    }
 
     // SAFETY: length + alignment checked above; the bindgen struct is
     // `#[repr(C)]` plain-old-data (no pointers), so re-interpreting the
@@ -71,13 +77,29 @@ pub fn parse_sps(bytes: &[u8]) -> Option<EncoderConfig> {
         0
     };
 
+    let mut width = u32::from(sps.picture_width_in_mbs) * 16;
+    let mut height = u32::from(sps.picture_height_in_mbs) * 16;
+    if sps.frame_cropping_flag != 0 {
+        // This backend accepts progressive 4:2:0 input. NVENC can crop
+        // padding at the right/bottom by encoding the visible dimensions.
+        if sps.frame_crop_left_offset != 0 || sps.frame_crop_top_offset != 0 {
+            return None;
+        }
+        width = width.checked_sub(sps.frame_crop_right_offset.checked_mul(2)?)?;
+        height = height.checked_sub(sps.frame_crop_bottom_offset.checked_mul(2)?)?;
+        if width == 0 || height == 0 {
+            return None;
+        }
+    }
     Some(EncoderConfig {
         bits_per_second: sps.bits_per_second,
         idr_period: sps.intra_idr_period,
         fps,
+        fps_num: sps.time_scale,
+        fps_den: sps.num_units_in_tick.checked_mul(2)?,
         max_num_ref_frames: sps.max_num_ref_frames,
-        width: (sps.picture_width_in_mbs as u32) * 16,
-        height: (sps.picture_height_in_mbs as u32) * 16,
+        width,
+        height,
         level_idc: sps.level_idc,
     })
 }
@@ -86,8 +108,12 @@ pub fn parse_sps(bytes: &[u8]) -> Option<EncoderConfig> {
 pub fn parse_pps(bytes: &[u8]) -> Option<PicParams> {
     let size = core::mem::size_of::<va::VAEncPictureParameterBufferH264>();
     let align = core::mem::align_of::<va::VAEncPictureParameterBufferH264>();
-    if bytes.len() < size { return None; }
-    if (bytes.as_ptr() as usize) % align != 0 { return None; }
+    if bytes.len() < size {
+        return None;
+    }
+    if bytes.as_ptr().align_offset(align) != 0 {
+        return None;
+    }
 
     // SAFETY: length + alignment checked; bindgen struct is POD repr(C).
     let pps: &va::VAEncPictureParameterBufferH264 =
@@ -184,5 +210,43 @@ mod tests {
         assert!(p.force_idr);
         assert_eq!(p.pic_init_qp, 28);
         assert_eq!(p.coded_buf, 0x1234_5678);
+    }
+}
+
+#[cfg(test)]
+mod visible_geometry_tests {
+    use super::*;
+    fn parse(width: u16, height: u16, right: u32, bottom: u32) -> Option<EncoderConfig> {
+        // SAFETY: POD parameter buffer, then initialise its geometry.
+        let mut sps: va::VAEncSequenceParameterBufferH264 = unsafe { core::mem::zeroed() };
+        sps.picture_width_in_mbs = width;
+        sps.picture_height_in_mbs = height;
+        sps.frame_cropping_flag = 1;
+        sps.frame_crop_right_offset = right;
+        sps.frame_crop_bottom_offset = bottom;
+        sps.time_scale = 60000;
+        sps.num_units_in_tick = 1001;
+        // SAFETY: the parameter struct remains alive and aligned during parsing.
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                (&sps as *const va::VAEncSequenceParameterBufferH264).cast(),
+                core::mem::size_of_val(&sps),
+            )
+        };
+        parse_sps(bytes)
+    }
+    #[test]
+    fn visible_dimensions_and_fractional_timebase_survive() {
+        let s = parse(54, 30, 5, 0).unwrap();
+        assert_eq!((s.width, s.height), (854, 480));
+        assert_eq!((s.fps_num, s.fps_den), (60000, 2002));
+        let s = parse(120, 68, 0, 4).unwrap();
+        assert_eq!((s.width, s.height), (1920, 1080));
+    }
+    #[test]
+    fn invalid_cropping_cannot_underflow() {
+        assert!(parse(1, 1, 9, 0).is_none());
+        assert!(parse(1, 1, u32::MAX, 0).is_none());
+        assert!(parse(1, 1, 8, 0).is_none());
     }
 }

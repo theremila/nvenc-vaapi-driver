@@ -1,34 +1,56 @@
-//! VAAPI synchronisation vtable entries: `vaSyncSurface`, `vaSyncSurface2`,
-//! `vaSyncBuffer`.
-//!
-//! NVENC encode is synchronous from the driver's perspective: by the time
-//! `vaEndPicture` returns, the encode call and `NvEncLockBitstream` will have
-//! completed (once the real backend is wired in). Therefore these sync entry
-//! points are permanent no-ops that return `VA_STATUS_SUCCESS` immediately.
-
-use super::guard;
-use crate::error::VAStatus;
+//! Encoding completes synchronously in vaEndPicture. Synchronisation still
+//! validates IDs/readiness so invalid or unsubmitted buffers cannot look ready.
+use super::{guard, state_from};
+use crate::driver::state::BufferStorage;
+use crate::error::{DriverError, VAStatus};
+use crate::ids::ContainsKey;
 use va_sys as va;
 
 pub unsafe extern "C" fn sync_surface(
-    _ctx: va::VADriverContextP,
-    _render_target: va::VASurfaceID,
+    ctx: va::VADriverContextP,
+    target: va::VASurfaceID,
 ) -> VAStatus {
-    guard(|| Ok(()))
+    guard(|| {
+        // SAFETY: caller supplies a live driver context.
+        let state = unsafe { state_from(ctx) }.ok_or(DriverError::InvalidParameter)?;
+        state
+            .pools
+            .lock()
+            .surfaces
+            .find_by_low_bits(target)
+            .ok_or(DriverError::InvalidSurface)?;
+        Ok(())
+    })
 }
 
 pub unsafe extern "C" fn sync_surface2(
-    _ctx: va::VADriverContextP,
-    _render_target: va::VASurfaceID,
+    ctx: va::VADriverContextP,
+    target: va::VASurfaceID,
     _timeout_ns: u64,
 ) -> VAStatus {
-    guard(|| Ok(()))
+    // SAFETY: synchronous implementation has the same preconditions.
+    unsafe { sync_surface(ctx, target) }
 }
 
 pub unsafe extern "C" fn sync_buffer(
-    _ctx: va::VADriverContextP,
-    _buf_id: va::VABufferID,
+    ctx: va::VADriverContextP,
+    id: va::VABufferID,
     _timeout_ns: u64,
 ) -> VAStatus {
-    guard(|| Ok(()))
+    guard(|| {
+        // SAFETY: caller supplies a live driver context.
+        let state = unsafe { state_from(ctx) }.ok_or(DriverError::InvalidParameter)?;
+        let pools = state.pools.lock();
+        let key = pools
+            .buffers
+            .find_by_low_bits(id)
+            .ok_or(DriverError::InvalidBuffer)?;
+        let rec = &pools.buffers[key];
+        if matches!(rec.storage, BufferStorage::Coded(_)) && !*rec.coded_ready.lock() {
+            return Err(DriverError::OperationFailed(
+                "coded buffer has no submitted picture",
+            ));
+        }
+        Ok(())
+    })
 }

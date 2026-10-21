@@ -1,42 +1,22 @@
 //! Real NVENC H.264 encode session.
 //!
-//! Covers the full map-encode-lock-unmap cycle over
-//! `nvidia_video_codec_sdk::sys::nvEncodeAPI` function pointers. The safe
-//! wrapper `ENCODE_API` is a `lazy_static` that `.expect()`s inside; we wrap
-//! every access in `catch_unwind` so that on a machine without
-//! `libnvidia-encode.so.1` we surface a clean `DriverError::OperationFailed`
-//! rather than aborting the process across the FFI boundary.
+//! NVENC functions are loaded lazily by the runtime loader. Missing libraries,
+//! unsupported versions and incomplete function tables produce explicit errors.
 //!
-//! The session owns:
-//! 1. A raw NVENC encoder handle (`*mut c_void`).
-//! 2. A table of `NV_ENC_REGISTERED_PTR` values keyed by `SurfaceKey`, built
-//!    by [`NvencSession::register_internal_surface`] as surfaces are
-//!    allocated.
-//! 3. A round-robin pool of bitstream output buffers. NVENC can return
-//!    `NV_ENC_ERR_NEED_MORE_INPUT` and defer output to a later frame; when
-//!    that happens we mark the slot `Pending` and keep the `mapped_input`
-//!    alive so that the driver can `Lock`/`Unmap` it once output actually
-//!    materialises. The slot state machine is a local 2-state enum — `Free`
-//!    vs `Pending { mapped_input, surface_key }` — deliberately kept simple:
-//!    we use 6 slots which is >= the NVENC look-ahead + B-frame horizon we
-//!    configure today (0 B-frames, no look-ahead).
+//! Each session caches input registrations and owns one reusable bitstream
+//! buffer. Linux synchronous encoding with no B-frames/lookahead returns
+//! exactly one coded picture for each successful submission.
 
+use super::api::{self, EncodeApi};
 use crate::error::DriverError;
 use crate::ids::SurfaceKey;
 use crate::nvenc::h264_config::{self, EncoderConfig, H264Profile};
 use crate::nvenc::preset::{NvencPreset, PresetChoice, Tuning};
 use core::ffi::c_void;
-use nvidia_video_codec_sdk::safe::{ENCODE_API, EncodeAPI};
 use nvidia_video_codec_sdk::sys::nvEncodeAPI as nv;
 use std::collections::HashMap;
 use std::mem::MaybeUninit;
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
-
-/// Size of the NVENC bitstream output pool. 6 slots cover CBR streams without
-/// look-ahead or B-frames with plenty of head-room to survive one or two
-/// `NV_ENC_ERR_NEED_MORE_INPUT` deferrals before back-pressuring callers.
-const POOL_SIZE: usize = 6;
 
 /// Resource bound to a specific VA surface after [`NvencSession::register_internal_surface`].
 ///
@@ -50,56 +30,16 @@ struct RegisteredSurface {
     pitch: u32,
 }
 
-/// Bitstream output slot state.
-///
-/// * `Free` — slot available for `encode_picture`.
-/// * `Pending` — NVENC returned `NEED_MORE_INPUT` for the previous frame
-///   targeting this slot; the mapped input must survive until the deferred
-///   output is unlocked.
-enum SlotState {
-    Free,
-    Pending {
-        mapped_input: nv::NV_ENC_INPUT_PTR,
-        _surface_key: SurfaceKey,
-    },
-}
-
-struct BitstreamSlot {
-    handle: nv::NV_ENC_OUTPUT_PTR,
-    state: SlotState,
-}
-
-/// Result of a single [`NvencSession::encode_frame`].
-///
-/// `is_pending=true` means NVENC buffered this frame; no bitstream bytes are
-/// available yet. The driver logs it and returns an empty coded buffer for
-/// this `vaEndPicture` — the client will (eventually) get the drained output
-/// on a later `encode_frame` call.
-#[derive(Debug, Default)]
-pub struct CodedBitstream {
-    pub data: Vec<u8>,
-    pub is_pending: bool,
-    pub is_idr: bool,
-}
-
 pub struct NvencSession {
     encoder: *mut c_void,
     _cuda_ctx: Arc<cudarc::driver::CudaContext>,
     config: EncoderConfig,
+    encode_config: nv::NV_ENC_CONFIG,
     /// Cached presetGUID so `reconfigure` can re-use it.
     preset_guid: nv::GUID,
     tuning: nv::NV_ENC_TUNING_INFO,
     registered: HashMap<SurfaceKey, RegisteredSurface>,
-    pool: Vec<BitstreamSlot>,
-    next_slot: usize,
-    /// FIFO of already-locked coded bitstreams waiting to be returned to the
-    /// client. NVENC is free to delay output by several `encode_picture`
-    /// calls (internal reorder / B-frame / lookahead queues); whenever a
-    /// `LockBitstream` call produces bytes we push them here, and each
-    /// `encode_frame()` call pops the oldest entry. This means a client
-    /// always sees output in submission order even if NVENC buffered N
-    /// earlier frames.
-    pending_outputs: std::collections::VecDeque<CodedBitstream>,
+    bitstream: nv::NV_ENC_OUTPUT_PTR,
 }
 
 // SAFETY: the NVENC encoder handle is an opaque driver resource; all access
@@ -111,9 +51,7 @@ unsafe impl Send for NvencSession {}
 impl NvencSession {
     /// Build a session. Requires a live CUDA context.
     ///
-    /// On machines without `libnvidia-encode.so.1` the `ENCODE_API`
-    /// `lazy_static` panics inside `.expect(...)`; we catch that panic and
-    /// convert it into a clean error.
+    /// Missing runtime libraries or unsupported API versions return an error.
     pub fn new(
         cuda: Arc<cudarc::driver::CudaContext>,
         cfg: EncoderConfig,
@@ -122,20 +60,13 @@ impl NvencSession {
         cuda.bind_to_thread()
             .map_err(|_| DriverError::OperationFailed("cuda bind_to_thread"))?;
 
-        // Probe ENCODE_API through catch_unwind so a missing libnvidia-encode
-        // does not abort the process.
-        let api = match catch_unwind(AssertUnwindSafe(|| &*ENCODE_API)) {
-            Ok(a) => a,
-            Err(_) => return Err(DriverError::OperationFailed("ENCODE_API unavailable")),
-        };
+        let api = api::get()?;
 
         // 1. Open session.
         let mut encoder: *mut c_void = core::ptr::null_mut();
         let mut session_params = open_session_ex_params(cuda.cu_ctx() as *mut c_void);
         // SAFETY: session_params is a valid initialised struct with correct VER.
-        let status = unsafe {
-            (api.open_encode_session_ex)(&mut session_params, &mut encoder)
-        };
+        let status = unsafe { (api.open_encode_session_ex)(&mut session_params, &mut encoder) };
         if status != nv::NVENCSTATUS::NV_ENC_SUCCESS || encoder.is_null() {
             return Err(DriverError::OperationFailed("NvEncOpenEncodeSessionEx"));
         }
@@ -151,9 +82,8 @@ impl NvencSession {
         // 3. Fetch preset-default NV_ENC_CONFIG and mutate it in-place.
         //    MaybeUninit::zeroed is correct because every field is either
         //    u32/enum/POD or will be overwritten by GetEncodePresetConfigEx.
-        let mut preset_cfg: nv::NV_ENC_PRESET_CONFIG = unsafe {
-            MaybeUninit::zeroed().assume_init()
-        };
+        let mut preset_cfg: nv::NV_ENC_PRESET_CONFIG =
+            unsafe { MaybeUninit::zeroed().assume_init() };
         preset_cfg.version = nv::NV_ENC_PRESET_CONFIG_VER;
         preset_cfg.presetCfg.version = nv::NV_ENC_CONFIG_VER;
         // SAFETY: encoder valid (just opened), preset_cfg is a fresh struct.
@@ -192,43 +122,30 @@ impl NvencSession {
             return Err(DriverError::OperationFailed("NvEncInitializeEncoder"));
         }
 
-        // 5. Bitstream pool.
-        let mut pool: Vec<BitstreamSlot> = Vec::with_capacity(POOL_SIZE);
-        for _ in 0..POOL_SIZE {
-            let mut params: nv::NV_ENC_CREATE_BITSTREAM_BUFFER = unsafe {
-                MaybeUninit::zeroed().assume_init()
-            };
-            params.version = nv::NV_ENC_CREATE_BITSTREAM_BUFFER_VER;
-            // size=0 lets NVENC pick based on encodeConfig.
-            params.memoryHeap = nv::NV_ENC_MEMORY_HEAP::NV_ENC_MEMORY_HEAP_VID;
-            // SAFETY: encoder valid, params correctly versioned.
-            let s = unsafe { (api.create_bitstream_buffer)(encoder, &mut params) };
-            if s != nv::NVENCSTATUS::NV_ENC_SUCCESS {
-                // Roll back already-created slots before returning.
-                for slot in &pool {
-                    // SAFETY: handle came from a successful CreateBitstreamBuffer.
-                    unsafe { (api.destroy_bitstream_buffer)(encoder, slot.handle) };
-                }
-                // SAFETY: encoder valid.
-                unsafe { (api.destroy_encoder)(encoder) };
-                return Err(DriverError::OperationFailed("NvEncCreateBitstreamBuffer"));
-            }
-            pool.push(BitstreamSlot {
-                handle: params.bitstreamBuffer,
-                state: SlotState::Free,
-            });
+        // One reusable output is sufficient: each call locks and unlocks it
+        // before returning, so additional buffers only consume video memory.
+        // SAFETY: POD descriptor, fields below select its ABI version.
+        let mut params: nv::NV_ENC_CREATE_BITSTREAM_BUFFER = unsafe { core::mem::zeroed() };
+        params.version = nv::NV_ENC_CREATE_BITSTREAM_BUFFER_VER;
+        params.memoryHeap = nv::NV_ENC_MEMORY_HEAP::NV_ENC_MEMORY_HEAP_VID;
+        // SAFETY: encoder is live and the descriptor is correctly versioned.
+        if unsafe { (api.create_bitstream_buffer)(encoder, &mut params) }
+            != nv::NVENCSTATUS::NV_ENC_SUCCESS
+        {
+            // SAFETY: no bitstream buffer was created; close the session.
+            unsafe { (api.destroy_encoder)(encoder) };
+            return Err(DriverError::OperationFailed("NvEncCreateBitstreamBuffer"));
         }
 
         Ok(Self {
             encoder,
             _cuda_ctx: cuda,
             config: cfg,
+            encode_config: preset_cfg.presetCfg,
             preset_guid,
             tuning,
             registered: HashMap::new(),
-            pool,
-            next_slot: 0,
-            pending_outputs: std::collections::VecDeque::new(),
+            bitstream: params.bitstreamBuffer,
         })
     }
 
@@ -244,16 +161,15 @@ impl NvencSession {
         width: u32,
         height: u32,
     ) -> Result<(), DriverError> {
+        self._cuda_ctx
+            .bind_to_thread()
+            .map_err(|_| DriverError::OperationFailed("cuda bind_to_thread"))?;
         if self.registered.contains_key(&key) {
             return Ok(());
         }
-        let api = match catch_unwind(AssertUnwindSafe(|| &*ENCODE_API)) {
-            Ok(a) => a,
-            Err(_) => return Err(DriverError::OperationFailed("ENCODE_API unavailable")),
-        };
-        let mut params: nv::NV_ENC_REGISTER_RESOURCE = unsafe {
-            MaybeUninit::zeroed().assume_init()
-        };
+        let api = api::get()?;
+        let mut params: nv::NV_ENC_REGISTER_RESOURCE =
+            unsafe { MaybeUninit::zeroed().assume_init() };
         params.version = nv::NV_ENC_REGISTER_RESOURCE_VER;
         params.resourceType =
             nv::NV_ENC_INPUT_RESOURCE_TYPE::NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR;
@@ -295,19 +211,17 @@ impl NvencSession {
         width: u32,
         height: u32,
     ) -> Result<nv::NV_ENC_REGISTERED_PTR, DriverError> {
+        self._cuda_ctx
+            .bind_to_thread()
+            .map_err(|_| DriverError::OperationFailed("cuda bind_to_thread"))?;
         if let Some(existing) = self.registered.get(&key) {
             return Ok(existing.registered_ptr);
         }
-        let api = match catch_unwind(AssertUnwindSafe(|| &*ENCODE_API)) {
-            Ok(a) => a,
-            Err(_) => return Err(DriverError::OperationFailed("ENCODE_API unavailable")),
-        };
-        let mut params: nv::NV_ENC_REGISTER_RESOURCE = unsafe {
-            MaybeUninit::zeroed().assume_init()
-        };
+        let api = api::get()?;
+        let mut params: nv::NV_ENC_REGISTER_RESOURCE =
+            unsafe { MaybeUninit::zeroed().assume_init() };
         params.version = nv::NV_ENC_REGISTER_RESOURCE_VER;
-        params.resourceType =
-            nv::NV_ENC_INPUT_RESOURCE_TYPE::NV_ENC_INPUT_RESOURCE_TYPE_CUDAARRAY;
+        params.resourceType = nv::NV_ENC_INPUT_RESOURCE_TYPE::NV_ENC_INPUT_RESOURCE_TYPE_CUDAARRAY;
         params.width = width;
         params.height = height;
         // For CUDAARRAY NVENC derives pitch from the array descriptor;
@@ -321,7 +235,9 @@ impl NvencSession {
         // SurfaceRec's ExternalDmaBufImage).
         let s = unsafe { (api.register_resource)(self.encoder, &mut params) };
         if s != nv::NVENCSTATUS::NV_ENC_SUCCESS {
-            return Err(DriverError::OperationFailed("NvEncRegisterResource(CUDAARRAY)"));
+            return Err(DriverError::OperationFailed(
+                "NvEncRegisterResource(CUDAARRAY)",
+            ));
         }
         let registered_ptr = params.registeredResource;
         self.registered.insert(
@@ -342,10 +258,13 @@ impl NvencSession {
     /// Used when a DMA-BUF-backed surface is destroyed so we tear down the
     /// NVENC-side registration before CUDA drops the underlying mipmap.
     pub fn unregister_surface(&mut self, key: SurfaceKey) {
+        if self._cuda_ctx.bind_to_thread().is_err() {
+            return;
+        }
         let Some(reg) = self.registered.remove(&key) else {
             return;
         };
-        let Ok(api) = catch_unwind(AssertUnwindSafe(|| &*ENCODE_API)) else {
+        let Ok(api) = api::get() else {
             return;
         };
         // SAFETY: registered_ptr came from a successful RegisterResource
@@ -355,232 +274,58 @@ impl NvencSession {
         }
     }
 
-    /// Encode one frame, honouring NVENC's internal reorder buffer.
-    ///
-    /// Three-phase flow:
-    /// 1. **Non-blocking drain** — walk every Pending slot; ask NVENC with
-    ///    `doNotWait=1` if output is ready. Ready slots return to the pool
-    ///    and their bytes are pushed onto `pending_outputs`.
-    /// 2. **Encode** — map the requested surface, submit to NVENC. On
-    ///    SUCCESS we lock+copy synchronously; on `NEED_MORE_INPUT` the slot
-    ///    becomes Pending.
-    /// 3. **Guarantee output** — if the FIFO is still empty but there *is* a
-    ///    Pending slot, do a *blocking* `LockBitstream` on the oldest one.
-    ///    This keeps WebRTC clients happy (they expect each `vaEndPicture`
-    ///    to surface bytes) while still letting NVENC's reorder queue do
-    ///    its job.
+    /// Synchronous, one-input/one-output encode. No lookahead or B-frames
+    /// are enabled; returning an older frame for a new VA coded buffer would
+    /// corrupt timestamps and references. Never report empty output as success.
     pub fn encode_frame(
         &mut self,
         key: SurfaceKey,
         force_idr: bool,
-    ) -> Result<CodedBitstream, DriverError> {
-        let api = match catch_unwind(AssertUnwindSafe(|| &*ENCODE_API)) {
-            Ok(a) => a,
-            Err(_) => return Err(DriverError::OperationFailed("ENCODE_API unavailable")),
-        };
-
-        // Phase 1 — non-blocking drain of already-ready Pending slots.
-        self.drain_pending_non_blocking(api);
-
-        // 1. Look up registered surface (copy out fields so we release the
-        //    &mut self borrow before we need &mut self.pool).
-        let (reg_ptr, reg_w, reg_h, reg_pitch) = {
-            let reg = self.registered.get(&key).ok_or(DriverError::InvalidSurface)?;
-            (reg.registered_ptr, reg.width, reg.height, reg.pitch)
-        };
-
-        // 2. Pick a Free slot round-robin, starting at next_slot.
-        let slot_idx = self.find_free_slot().ok_or(DriverError::OperationFailed(
-            "NVENC bitstream pool exhausted",
-        ))?;
-
-        // 3. Map the registered resource for this encode call.
-        let mut map: nv::NV_ENC_MAP_INPUT_RESOURCE = unsafe {
-            MaybeUninit::zeroed().assume_init()
-        };
+        output: &mut Vec<u8>,
+    ) -> Result<(), DriverError> {
+        self._cuda_ctx
+            .bind_to_thread()
+            .map_err(|_| DriverError::OperationFailed("cuda bind_to_thread"))?;
+        let api = api::get()?;
+        let reg = self
+            .registered
+            .get(&key)
+            .ok_or(DriverError::InvalidSurface)?;
+        // SAFETY: POD descriptor, version and registered resource set below.
+        let mut map: nv::NV_ENC_MAP_INPUT_RESOURCE = unsafe { core::mem::zeroed() };
         map.version = nv::NV_ENC_MAP_INPUT_RESOURCE_VER;
-        map.registeredResource = reg_ptr;
-        // SAFETY: encoder valid; reg_ptr was produced by RegisterResource.
-        let s = unsafe { (api.map_input_resource)(self.encoder, &mut map) };
-        if s != nv::NVENCSTATUS::NV_ENC_SUCCESS {
+        map.registeredResource = reg.registered_ptr;
+        // SAFETY: registered resource belongs to this live encoder.
+        if unsafe { (api.map_input_resource)(self.encoder, &mut map) }
+            != nv::NVENCSTATUS::NV_ENC_SUCCESS
+        {
             return Err(DriverError::OperationFailed("NvEncMapInputResource"));
         }
-        let mapped_input = map.mappedResource;
-
-        // Phase 2 — submit the encode call.
-        let slot_handle = self.pool[slot_idx].handle;
+        let handle = self.bitstream;
         let mut pic = pic_params(
-            reg_w,
-            reg_h,
-            reg_pitch,
-            mapped_input,
-            slot_handle,
+            reg.width,
+            reg.height,
+            reg.pitch,
+            map.mappedResource,
+            handle,
             force_idr,
         );
-        // SAFETY: encoder valid; pic references live buffers for the call.
+        // SAFETY: all resources remain live until lock/unmap completes.
         let status = unsafe { (api.encode_picture)(self.encoder, &mut pic) };
-
-        match status {
-            nv::NVENCSTATUS::NV_ENC_SUCCESS => {
-                // Output available immediately — lock, copy, unlock, unmap.
-                let bitstream = self.lock_and_copy(api, slot_handle)?;
-                // SAFETY: mapped_input was returned by MapInputResource.
-                let _ = unsafe { (api.unmap_input_resource)(self.encoder, mapped_input) };
-                self.pool[slot_idx].state = SlotState::Free;
-                self.next_slot = (slot_idx + 1) % self.pool.len();
-                self.pending_outputs.push_back(bitstream);
-            }
-            nv::NVENCSTATUS::NV_ENC_ERR_NEED_MORE_INPUT => {
-                // Deferred. Keep the mapped_input alive until NVENC flushes.
-                self.pool[slot_idx].state = SlotState::Pending {
-                    mapped_input,
-                    _surface_key: key,
-                };
-                self.next_slot = (slot_idx + 1) % self.pool.len();
-            }
-            _ => {
-                // SAFETY: mapped_input was returned by MapInputResource.
-                let _ = unsafe { (api.unmap_input_resource)(self.encoder, mapped_input) };
-                return Err(DriverError::Encoding("NvEncEncodePicture"));
-            }
+        let result = if status == nv::NVENCSTATUS::NV_ENC_SUCCESS {
+            self.lock_and_copy(api, handle, output)
+        } else {
+            Err(DriverError::Encoding(
+                "NvEncEncodePicture: synchronous output unavailable",
+            ))
+        };
+        // SAFETY: paired with the successful map, including error paths.
+        let unmap = unsafe { (api.unmap_input_resource)(self.encoder, map.mappedResource) };
+        result?;
+        if unmap != nv::NVENCSTATUS::NV_ENC_SUCCESS {
+            return Err(DriverError::OperationFailed("NvEncUnmapInputResource"));
         }
-
-        // Phase 3 — try exactly one non-blocking drain of an oldest Pending
-        // slot if the FIFO is still empty. We intentionally do NOT do a
-        // blocking lock here: an earlier iteration that did was observed
-        // to freeze Vesktop when NVENC held an orphan Pending slot across
-        // a `reconfigure`, because `lock_and_copy` then waits forever for
-        // output NVENC will never produce on that slot. A single
-        // non-blocking probe is enough to cover the "NVENC finished this
-        // frame while we were still preparing the next" case, which is
-        // the only timing the WebRTC quality controller actually cares
-        // about.
-        if self.pending_outputs.is_empty() {
-            if let Some(idx) = self.oldest_pending_slot() {
-                let mut lock: nv::NV_ENC_LOCK_BITSTREAM = unsafe {
-                    MaybeUninit::zeroed().assume_init()
-                };
-                lock.version = nv::NV_ENC_LOCK_BITSTREAM_VER;
-                lock.outputBitstream = self.pool[idx].handle;
-                lock.set_doNotWait(1);
-                // SAFETY: encoder + slot handle both valid.
-                let s = unsafe { (api.lock_bitstream)(self.encoder, &mut lock) };
-                if s == nv::NVENCSTATUS::NV_ENC_SUCCESS {
-                    let len = lock.bitstreamSizeInBytes as usize;
-                    let mut data: Vec<u8> = Vec::with_capacity(len);
-                    // SAFETY: NVENC gave us a readable ptr of length `bitstreamSizeInBytes`.
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(
-                            lock.bitstreamBufferPtr as *const u8,
-                            data.as_mut_ptr(),
-                            len,
-                        );
-                        data.set_len(len);
-                    }
-                    let is_idr =
-                        lock.pictureType == nv::NV_ENC_PIC_TYPE::NV_ENC_PIC_TYPE_IDR;
-                    // SAFETY: just-locked handle.
-                    let _ = unsafe {
-                        (api.unlock_bitstream)(self.encoder, self.pool[idx].handle)
-                    };
-                    if let SlotState::Pending { mapped_input, .. } = self.pool[idx].state {
-                        // SAFETY: mapped_input alive across Pending state.
-                        let _ = unsafe { (api.unmap_input_resource)(self.encoder, mapped_input) };
-                    }
-                    self.pool[idx].state = SlotState::Free;
-                    self.pending_outputs.push_back(CodedBitstream {
-                        data,
-                        is_pending: false,
-                        is_idr,
-                    });
-                }
-            }
-        }
-
-        // Pop the oldest ready bitstream. When nothing is ready we return
-        // is_pending=true — the caller writes an empty coded-buffer for
-        // this frame, NVENC flushes it next time. WebRTC does penalise
-        // this as a drop; that is the root of the HW↔SW cycling we see
-        // in Vesktop, but it is preferable to a freeze.
-        Ok(self.pending_outputs.pop_front().unwrap_or(CodedBitstream {
-            data: Vec::new(),
-            is_pending: true,
-            is_idr: false,
-        }))
-    }
-
-    /// Walk every Pending slot and try a non-blocking `LockBitstream`.
-    /// Slots that have output ready return to `Free` and push their
-    /// bitstream onto `self.pending_outputs`. Slots still busy stay
-    /// Pending. Other errors free the slot (log and continue).
-    fn drain_pending_non_blocking(&mut self, api: &EncodeAPI) {
-        for idx in 0..self.pool.len() {
-            let (handle, mapped_input) = match self.pool[idx].state {
-                SlotState::Pending { mapped_input, .. } => (self.pool[idx].handle, mapped_input),
-                _ => continue,
-            };
-            let mut lock: nv::NV_ENC_LOCK_BITSTREAM = unsafe {
-                MaybeUninit::zeroed().assume_init()
-            };
-            lock.version = nv::NV_ENC_LOCK_BITSTREAM_VER;
-            lock.outputBitstream = handle;
-            lock.set_doNotWait(1);
-            // SAFETY: encoder + handle both valid; lock is freshly zeroed.
-            let s = unsafe { (api.lock_bitstream)(self.encoder, &mut lock) };
-            match s {
-                nv::NVENCSTATUS::NV_ENC_SUCCESS => {
-                    let len = lock.bitstreamSizeInBytes as usize;
-                    let mut data: Vec<u8> = Vec::with_capacity(len);
-                    // SAFETY: NVENC returns a readable pointer of length `bitstreamSizeInBytes`.
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(
-                            lock.bitstreamBufferPtr as *const u8,
-                            data.as_mut_ptr(),
-                            len,
-                        );
-                        data.set_len(len);
-                    }
-                    let is_idr = lock.pictureType == nv::NV_ENC_PIC_TYPE::NV_ENC_PIC_TYPE_IDR;
-                    // SAFETY: handle we just locked.
-                    let _ = unsafe { (api.unlock_bitstream)(self.encoder, handle) };
-                    // SAFETY: mapped_input stayed alive across Pending state.
-                    let _ = unsafe { (api.unmap_input_resource)(self.encoder, mapped_input) };
-                    self.pool[idx].state = SlotState::Free;
-                    self.pending_outputs.push_back(CodedBitstream {
-                        data,
-                        is_pending: false,
-                        is_idr,
-                    });
-                }
-                nv::NVENCSTATUS::NV_ENC_ERR_LOCK_BUSY => {
-                    // Not ready yet — leave Pending.
-                }
-                _ => {
-                    // Unexpected error. Free the slot so we don't wedge forever;
-                    // the mapped input is released best-effort.
-                    // SAFETY: mapped_input came from MapInputResource.
-                    let _ = unsafe { (api.unmap_input_resource)(self.encoder, mapped_input) };
-                    self.pool[idx].state = SlotState::Free;
-                }
-            }
-        }
-    }
-
-    /// Index of the oldest Pending slot, or None if none are pending.
-    /// Uses `next_slot` as a proxy for round-robin order: the Pending slot
-    /// nearest (next_slot - 1) in cyclic order is the oldest submission.
-    fn oldest_pending_slot(&self) -> Option<usize> {
-        let n = self.pool.len();
-        if n == 0 {
-            return None;
-        }
-        for offset in 0..n {
-            let idx = (self.next_slot + n - 1 - offset) % n;
-            if matches!(self.pool[idx].state, SlotState::Pending { .. }) {
-                return Some(idx);
-            }
-        }
-        None
+        Ok(())
     }
 
     /// Best-effort runtime reconfiguration. On failure we keep the old config
@@ -598,65 +343,34 @@ impl NvencSession {
         new_cfg: EncoderConfig,
         force_idr: bool,
     ) -> Result<(), DriverError> {
+        self._cuda_ctx
+            .bind_to_thread()
+            .map_err(|_| DriverError::OperationFailed("cuda bind_to_thread"))?;
         if new_cfg == self.config {
             return Ok(());
         }
-        let api = match catch_unwind(AssertUnwindSafe(|| &*ENCODE_API)) {
-            Ok(a) => a,
-            Err(_) => return Err(DriverError::OperationFailed("ENCODE_API unavailable")),
-        };
+        let api = api::get()?;
 
-        // Build a fresh preset config and re-apply.
-        let mut preset_cfg: nv::NV_ENC_PRESET_CONFIG = unsafe {
-            MaybeUninit::zeroed().assume_init()
-        };
-        preset_cfg.version = nv::NV_ENC_PRESET_CONFIG_VER;
-        preset_cfg.presetCfg.version = nv::NV_ENC_CONFIG_VER;
-        // SAFETY: encoder valid.
-        let s = unsafe {
-            (api.get_encode_preset_config_ex)(
-                self.encoder,
-                nv::NV_ENC_CODEC_H264_GUID,
-                self.preset_guid,
-                self.tuning,
-                &mut preset_cfg,
-            )
-        };
-        if s != nv::NVENCSTATUS::NV_ENC_SUCCESS {
-            return Err(DriverError::OperationFailed("NvEncGetEncodePresetConfigEx"));
-        }
-        h264_config::apply_config(&mut preset_cfg.presetCfg, &new_cfg);
-        preset_cfg.presetCfg.profileGUID = match new_cfg.profile {
-            H264Profile::Main => nv::NV_ENC_H264_PROFILE_MAIN_GUID,
-            H264Profile::ConstrainedBaseline => nv::NV_ENC_H264_PROFILE_BASELINE_GUID,
-            H264Profile::High => nv::NV_ENC_H264_PROFILE_HIGH_GUID,
-        };
-
-        let mut reinit = init_params(
-            &new_cfg,
-            self.preset_guid,
-            self.tuning,
-            &mut preset_cfg.presetCfg as *mut nv::NV_ENC_CONFIG,
-        );
-        let mut recfg: nv::NV_ENC_RECONFIGURE_PARAMS = unsafe {
-            MaybeUninit::zeroed().assume_init()
-        };
+        // Preserve the successful preset configuration. A bitrate update
+        // does not need another driver query or a different preset.
+        let mut encode_config = self.encode_config;
+        h264_config::apply_config(&mut encode_config, &new_cfg);
+        let reinit = init_params(&new_cfg, self.preset_guid, self.tuning, &mut encode_config);
+        let mut recfg: nv::NV_ENC_RECONFIGURE_PARAMS =
+            unsafe { MaybeUninit::zeroed().assume_init() };
         recfg.version = nv::NV_ENC_RECONFIGURE_PARAMS_VER;
         recfg.reInitEncodeParams = reinit;
         if force_idr {
             recfg.set_forceIDR(1);
         }
         // SAFETY: encoder valid; recfg self-contained except reInitEncodeParams
-        // which references preset_cfg, which outlives this call.
+        // which references encode_config, which outlives this call.
         let status = unsafe { (api.reconfigure_encoder)(self.encoder, &mut recfg) };
-        // Defeat unused warning on `reinit` — we deliberately drop the local
-        // so the borrow checker stops worrying about its lifetime after the
-        // FFI call completes.
-        let _ = &mut reinit;
         if status != nv::NVENCSTATUS::NV_ENC_SUCCESS {
             return Err(DriverError::OperationFailed("NvEncReconfigureEncoder"));
         }
         self.config = new_cfg;
+        self.encode_config = encode_config;
         Ok(())
     }
 
@@ -668,25 +382,13 @@ impl NvencSession {
 
     // -------- internals --------
 
-    fn find_free_slot(&self) -> Option<usize> {
-        let n = self.pool.len();
-        for i in 0..n {
-            let idx = (self.next_slot + i) % n;
-            if matches!(self.pool[idx].state, SlotState::Free) {
-                return Some(idx);
-            }
-        }
-        None
-    }
-
     fn lock_and_copy(
         &mut self,
-        api: &EncodeAPI,
+        api: &EncodeApi,
         slot_handle: nv::NV_ENC_OUTPUT_PTR,
-    ) -> Result<CodedBitstream, DriverError> {
-        let mut lock: nv::NV_ENC_LOCK_BITSTREAM = unsafe {
-            MaybeUninit::zeroed().assume_init()
-        };
+        data: &mut Vec<u8>,
+    ) -> Result<(), DriverError> {
+        let mut lock: nv::NV_ENC_LOCK_BITSTREAM = unsafe { MaybeUninit::zeroed().assume_init() };
         lock.version = nv::NV_ENC_LOCK_BITSTREAM_VER;
         lock.outputBitstream = slot_handle;
         // SAFETY: encoder valid, slot_handle from CreateBitstreamBuffer.
@@ -695,45 +397,47 @@ impl NvencSession {
             return Err(DriverError::Encoding("NvEncLockBitstream"));
         }
         let len = lock.bitstreamSizeInBytes as usize;
-        let mut data: Vec<u8> = Vec::with_capacity(len);
-        // SAFETY: NVENC returns a readable pointer of length `bitstreamSizeInBytes`.
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                lock.bitstreamBufferPtr as *const u8,
-                data.as_mut_ptr(),
-                len,
-            );
-            data.set_len(len);
+        let result = (|| {
+            if len == 0 || lock.bitstreamBufferPtr.is_null() {
+                return Err(DriverError::Encoding("NVENC returned an empty picture"));
+            }
+            // Reuse the VA coded buffer allocation across frames. Only
+            // compressed bytes cross this boundary; raw input stays on CUDA.
+            data.clear();
+            data.try_reserve(len)
+                .map_err(|_| DriverError::AllocFailed)?;
+            // SAFETY: NVENC returned a non-null, locked buffer of len bytes;
+            // the destination has capacity for exactly those bytes.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    lock.bitstreamBufferPtr.cast::<u8>(),
+                    data.as_mut_ptr(),
+                    len,
+                );
+                data.set_len(len);
+            }
+            Ok(())
+        })();
+        // SAFETY: paired with a successful lock, also on allocation failure.
+        let status = unsafe { (api.unlock_bitstream)(self.encoder, slot_handle) };
+        result?;
+        if status != nv::NVENCSTATUS::NV_ENC_SUCCESS {
+            return Err(DriverError::OperationFailed("NvEncUnlockBitstream"));
         }
-        let is_idr = lock.pictureType == nv::NV_ENC_PIC_TYPE::NV_ENC_PIC_TYPE_IDR;
-        // SAFETY: same slot_handle just locked.
-        let _ = unsafe { (api.unlock_bitstream)(self.encoder, slot_handle) };
-        Ok(CodedBitstream {
-            data,
-            is_pending: false,
-            is_idr,
-        })
+        Ok(())
     }
 }
 
 impl Drop for NvencSession {
     fn drop(&mut self) {
-        let api = match catch_unwind(AssertUnwindSafe(|| &*ENCODE_API)) {
-            Ok(a) => a,
-            Err(_) => return, // cannot clean up without the API; leak is harmless at shutdown
+        if self._cuda_ctx.bind_to_thread().is_err() {
+            return;
+        }
+        let Ok(api) = api::get() else {
+            return;
         };
-        // Unmap any pending mapped inputs.
-        for slot in &self.pool {
-            if let SlotState::Pending { mapped_input, .. } = &slot.state {
-                // SAFETY: mapped_input was obtained via MapInputResource.
-                unsafe { (api.unmap_input_resource)(self.encoder, *mapped_input) };
-            }
-        }
-        // Destroy bitstream buffers.
-        for slot in &self.pool {
-            // SAFETY: handle came from CreateBitstreamBuffer.
-            unsafe { (api.destroy_bitstream_buffer)(self.encoder, slot.handle) };
-        }
+        // SAFETY: bitstream came from this encoder and is not locked.
+        unsafe { (api.destroy_bitstream_buffer)(self.encoder, self.bitstream) };
         // Unregister all surfaces.
         for reg in self.registered.values() {
             // SAFETY: registered_ptr came from RegisterResource.
@@ -750,9 +454,8 @@ impl Drop for NvencSession {
 
 fn open_session_ex_params(device: *mut c_void) -> nv::NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS {
     // SAFETY: struct is POD; zero is a valid bit pattern for every field.
-    let mut p: nv::NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS = unsafe {
-        MaybeUninit::zeroed().assume_init()
-    };
+    let mut p: nv::NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS =
+        unsafe { MaybeUninit::zeroed().assume_init() };
     p.version = nv::NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER;
     p.deviceType = nv::NV_ENC_DEVICE_TYPE::NV_ENC_DEVICE_TYPE_CUDA;
     p.device = device;
@@ -767,9 +470,7 @@ fn init_params(
     encode_config: *mut nv::NV_ENC_CONFIG,
 ) -> nv::NV_ENC_INITIALIZE_PARAMS {
     // SAFETY: POD; zero is valid for every field.
-    let mut p: nv::NV_ENC_INITIALIZE_PARAMS = unsafe {
-        MaybeUninit::zeroed().assume_init()
-    };
+    let mut p: nv::NV_ENC_INITIALIZE_PARAMS = unsafe { MaybeUninit::zeroed().assume_init() };
     p.version = nv::NV_ENC_INITIALIZE_PARAMS_VER;
     p.encodeGUID = nv::NV_ENC_CODEC_H264_GUID;
     p.presetGUID = preset_guid;
@@ -796,9 +497,7 @@ fn pic_params(
     force_idr: bool,
 ) -> nv::NV_ENC_PIC_PARAMS {
     // SAFETY: POD with zeroed-init; we fill the fields we care about.
-    let mut p: nv::NV_ENC_PIC_PARAMS = unsafe {
-        MaybeUninit::zeroed().assume_init()
-    };
+    let mut p: nv::NV_ENC_PIC_PARAMS = unsafe { MaybeUninit::zeroed().assume_init() };
     p.version = nv::NV_ENC_PIC_PARAMS_VER;
     p.inputWidth = width;
     p.inputHeight = height;
@@ -808,8 +507,7 @@ fn pic_params(
     p.bufferFmt = nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_NV12;
     p.pictureStruct = nv::NV_ENC_PIC_STRUCT::NV_ENC_PIC_STRUCT_FRAME;
     if force_idr {
-        p.encodePicFlags =
-            nv::NV_ENC_PIC_FLAGS::NV_ENC_PIC_FLAG_FORCEIDR as u32;
+        p.encodePicFlags = nv::NV_ENC_PIC_FLAGS::NV_ENC_PIC_FLAG_FORCEIDR as u32;
     }
     p
 }
@@ -817,7 +515,7 @@ fn pic_params(
 fn map_preset_choice(cfg: EncoderConfig) -> (nv::GUID, nv::NV_ENC_TUNING_INFO) {
     let rc_wants_cqp = matches!(cfg.rc_mode, crate::nvenc::preset::RcMode::ConstQp);
     let bitrate = cfg.bitrate_bps as u64;
-    let fps = if cfg.fps_den > 0 { cfg.fps_num / cfg.fps_den } else { 30 };
+    let fps = cfg.fps_num.checked_div(cfg.fps_den).unwrap_or(30);
     let choice: PresetChoice = crate::nvenc::preset::choose(bitrate, fps, rc_wants_cqp);
     let guid = match choice.preset {
         NvencPreset::P3 => nv::NV_ENC_PRESET_P3_GUID,
@@ -853,7 +551,7 @@ mod tests {
         let (_guid, tuning) = map_preset_choice(cfg);
         assert_eq!(
             tuning,
-            nv::NV_ENC_TUNING_INFO::NV_ENC_TUNING_INFO_LOW_LATENCY
+            nv::NV_ENC_TUNING_INFO::NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY
         );
     }
 
@@ -873,17 +571,14 @@ mod tests {
         );
     }
 
-    // Slot state machine: free → pending → free transitions.
     #[test]
-    fn slot_state_round_robin_math() {
-        // Small pure model of the round-robin pointer update.
-        let pool_size = 6;
-        let mut next = 0usize;
-        for step in 0..20 {
-            let picked = next;
-            next = (picked + 1) % pool_size;
-            assert_eq!(picked, step % pool_size);
-        }
-        assert_eq!(next, 20 % pool_size);
+    fn synchronous_params_have_no_async_queue() {
+        let cfg = EncoderConfig::default_for(1920, 1080, H264Profile::Main);
+        let (guid, tuning) = map_preset_choice(cfg);
+        let params = init_params(&cfg, guid, tuning, core::ptr::null_mut());
+        assert_eq!(params.enableEncodeAsync, 0);
+        assert_eq!(params.enablePTD, 1);
+        assert_eq!(params.frameRateNum, 60);
+        assert_eq!(params.frameRateDen, 1);
     }
 }

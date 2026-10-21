@@ -44,9 +44,11 @@ pub struct EncoderConfig {
     pub fps_num: u32,
     pub fps_den: u32,
     pub bitrate_bps: u32,
+    pub max_bitrate_bps: u32,
     pub gop_length: u32,
     pub profile: H264Profile,
     pub rc_mode: preset::RcMode,
+    pub qp: u32,
     /// Коли `true`, NVENC сам вставляє SPS+PPS перед кожним IDR
     /// (`repeatSPSPPS=1`). Це історичний default для ffmpeg/gst-клієнтів,
     /// які не шлють `VAEncPackedHeader*`. Коли `false`, клієнт сам веде
@@ -67,9 +69,11 @@ impl EncoderConfig {
             fps_num: 60,
             fps_den: 1,
             bitrate_bps: 5_000_000,
+            max_bitrate_bps: 5_000_000,
             gop_length: 120,
             profile,
             rc_mode: preset::RcMode::Cbr,
+            qp: 28,
             repeat_sps_pps: true,
         }
     }
@@ -84,9 +88,7 @@ fn per_frame_bits(bitrate_bps: u32, fps_num: u32, fps_den: u32) -> u32 {
     }
     // ((bitrate * fps_den) / fps_num) у u64, щоб не переповнити u32 на
     // високих bitrate-ах (10 Mbps * 1001 = ~10 G, поміщається в u64).
-    let per = (bitrate_bps as u64)
-        .saturating_mul(fps_den as u64)
-        / (fps_num as u64);
+    let per = (bitrate_bps as u64).saturating_mul(fps_den as u64) / (fps_num as u64);
     per.min(u32::MAX as u64) as u32
 }
 
@@ -140,19 +142,16 @@ pub fn apply_config(preset_cfg: &mut nv::NV_ENC_CONFIG, cfg: &EncoderConfig) {
         preset::RcMode::Vbr => {
             rc.rateControlMode = nv::NV_ENC_PARAMS_RC_MODE::NV_ENC_PARAMS_RC_VBR;
             rc.averageBitRate = cfg.bitrate_bps;
-            // maxBitRate лишаємо як preset поставив, або дублюємо.
-            if rc.maxBitRate < cfg.bitrate_bps {
-                rc.maxBitRate = cfg.bitrate_bps;
-            }
+            rc.maxBitRate = cfg.max_bitrate_bps.max(cfg.bitrate_bps);
         }
         preset::RcMode::ConstQp => {
             rc.rateControlMode = nv::NV_ENC_PARAMS_RC_MODE::NV_ENC_PARAMS_RC_CONSTQP;
             // Розумний default — QP 28 (Discord-типовий сценарій);
             // точний QP прийде у c.2 з VAEncMiscParameterQP.
             rc.constQP = nv::NV_ENC_QP {
-                qpInterP: 28,
-                qpInterB: 28,
-                qpIntra: 28,
+                qpInterP: cfg.qp,
+                qpInterB: cfg.qp,
+                qpIntra: cfg.qp,
             };
         }
     }
@@ -179,10 +178,12 @@ pub fn apply_config(preset_cfg: &mut nv::NV_ENC_CONFIG, cfg: &EncoderConfig) {
     h264.sliceModeData = 1; // 1 slice per frame
     h264.chromaFormatIDC = 1; // 4:2:0
     h264.entropyCodingMode = match cfg.profile {
-        H264Profile::Main | H264Profile::High =>
-            nv::NV_ENC_H264_ENTROPY_CODING_MODE::NV_ENC_H264_ENTROPY_CODING_MODE_CABAC,
-        H264Profile::ConstrainedBaseline =>
-            nv::NV_ENC_H264_ENTROPY_CODING_MODE::NV_ENC_H264_ENTROPY_CODING_MODE_CAVLC,
+        H264Profile::Main | H264Profile::High => {
+            nv::NV_ENC_H264_ENTROPY_CODING_MODE::NV_ENC_H264_ENTROPY_CODING_MODE_CABAC
+        }
+        H264Profile::ConstrainedBaseline => {
+            nv::NV_ENC_H264_ENTROPY_CODING_MODE::NV_ENC_H264_ENTROPY_CODING_MODE_CAVLC
+        }
     };
     // `repeatSPSPPS` керується з `EncoderConfig`: ffmpeg-like клієнти
     // хочуть SPS+PPS на кожному IDR від енкодера, WebRTC/Chromium — ні
@@ -224,9 +225,11 @@ mod tests {
             fps_num: 60,
             fps_den: 1,
             bitrate_bps: 5_000_000,
+            max_bitrate_bps: 5_000_000,
             gop_length: 120,
             profile: H264Profile::Main,
             rc_mode: preset::RcMode::Cbr,
+            qp: 28,
             repeat_sps_pps: true,
         }
     }
@@ -323,9 +326,11 @@ mod tests {
             fps_num: 24_000,
             fps_den: 1001, // 23.976
             bitrate_bps: 500_000,
+            max_bitrate_bps: 500_000,
             gop_length: 1,
             profile: H264Profile::Main,
             rc_mode: preset::RcMode::Cbr,
+            qp: 28,
             repeat_sps_pps: true,
         };
         apply_config(&mut cfg, &ec);
@@ -386,5 +391,21 @@ mod tests {
         // VBV = 1 s of bitrate; initial delay = 500 ms.
         assert_eq!(cfg.rcParams.vbvBufferSize, 10_000_000);
         assert_eq!(cfg.rcParams.vbvInitialDelay, 5_000_000);
+    }
+    #[test]
+    fn vbr_retains_separate_average_and_peak_and_cqp_honours_client_qp() {
+        let mut config = zeroed_preset();
+        let mut request = default_1080p60_cbr();
+        request.rc_mode = preset::RcMode::Vbr;
+        request.bitrate_bps = 2_000_000;
+        request.max_bitrate_bps = 4_000_000;
+        apply_config(&mut config, &request);
+        assert_eq!(config.rcParams.averageBitRate, 2_000_000);
+        assert_eq!(config.rcParams.maxBitRate, 4_000_000);
+        request.rc_mode = preset::RcMode::ConstQp;
+        request.qp = 20;
+        apply_config(&mut config, &request);
+        assert_eq!(config.rcParams.constQP.qpIntra, 20);
+        assert_eq!(config.rcParams.constQP.qpInterP, 20);
     }
 }

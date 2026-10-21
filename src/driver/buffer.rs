@@ -30,20 +30,23 @@ pub unsafe extern "C" fn create_buffer(
         if buf_id.is_null() {
             return Err(DriverError::InvalidParameter);
         }
-        let total = (size as usize).checked_mul(num_elements as usize)
+        let total = (size as usize)
+            .checked_mul(num_elements as usize)
             .ok_or(DriverError::InvalidParameter)?;
         let mut bytes: Vec<u8> = Vec::new();
         // Try_reserve to surface OOM as VA_STATUS_ERROR_ALLOCATION_FAILED.
-        bytes.try_reserve_exact(total).map_err(|_| DriverError::AllocFailed)?;
-        bytes.resize(total, 0);
+        bytes
+            .try_reserve_exact(total)
+            .map_err(|_| DriverError::AllocFailed)?;
+        // Coded output is written by NVENC later. Reserve the client's
+        // capacity without touching/zeroing an entire frame-sized allocation.
+        if buf_type != va::VAEncCodedBufferType || !data.is_null() {
+            bytes.resize(total, 0);
+        }
         if !data.is_null() && total > 0 {
             // SAFETY: caller promises `data` points to `total` readable bytes.
             unsafe {
-                core::ptr::copy_nonoverlapping(
-                    data as *const u8,
-                    bytes.as_mut_ptr(),
-                    total,
-                );
+                core::ptr::copy_nonoverlapping(data as *const u8, bytes.as_mut_ptr(), total);
             }
         }
         // Coded-output буфери отримують окремий slot із pinned
@@ -60,11 +63,13 @@ pub unsafe extern "C" fn create_buffer(
             buf_type,
             element_size: size,
             num_elements,
+            allocated_elements: num_elements,
             storage,
             coded_ready: Mutex::new(false),
+            mapped: Mutex::new(false),
         };
         let mut pools = state.pools.lock();
-        let k: BufferKey = pools.buffers.insert(rec);
+        let k: BufferKey = pools.buffers.insert(rec)?;
         // SAFETY: non-null checked.
         unsafe { *buf_id = key_to_id(k) as va::VABufferID };
         Ok(())
@@ -85,9 +90,13 @@ pub unsafe extern "C" fn map_buffer(
         let pools = state.pools.lock();
         let k = pools
             .buffers
-            .find_by_low_bits(buf_id as u32)
+            .find_by_low_bits(buf_id)
             .ok_or(DriverError::InvalidBuffer)?;
         let rec = &pools.buffers[k];
+        let mut mapped = rec.mapped.lock();
+        if *mapped {
+            return Err(DriverError::InvalidParameter);
+        }
         let ptr: *mut c_void = match &rec.storage {
             BufferStorage::Generic(m) => {
                 // We hand back a raw pointer into the locked-Vec's storage.
@@ -101,8 +110,9 @@ pub unsafe extern "C" fn map_buffer(
                 p as *mut c_void
             }
             BufferStorage::Coded(slot) => {
-                // Real bitstream pipeline is wired in slice c.2; until then
-                // there is no segment to hand out.
+                if !*rec.coded_ready.lock() {
+                    return Err(DriverError::OperationFailed("coded buffer not ready"));
+                }
                 let seg = slot.segment.lock();
                 match seg.as_ref() {
                     Some(boxed) => {
@@ -110,12 +120,17 @@ pub unsafe extern "C" fn map_buffer(
                             as *mut va::VACodedBufferSegment;
                         raw as *mut c_void
                     }
-                    None => return Err(DriverError::OperationFailed("coded buffer not ready — did you call vaEndPicture?")),
+                    None => {
+                        return Err(DriverError::OperationFailed(
+                            "coded buffer not ready — did you call vaEndPicture?",
+                        ));
+                    }
                 }
             }
         };
         // SAFETY: non-null checked.
         unsafe { *pbuf = ptr };
+        *mapped = true;
         Ok(())
     })
 }
@@ -140,9 +155,14 @@ pub unsafe extern "C" fn unmap_buffer(
         let pools = state.pools.lock();
         let k = pools
             .buffers
-            .find_by_low_bits(buf_id as u32)
+            .find_by_low_bits(buf_id)
             .ok_or(DriverError::InvalidBuffer)?;
         let rec = &pools.buffers[k];
+        let mut mapped = rec.mapped.lock();
+        if !*mapped {
+            return Err(DriverError::InvalidParameter);
+        }
+        *mapped = false;
         match &rec.storage {
             BufferStorage::Generic(m) => {
                 // SAFETY: we forgot the guard in map_buffer, meaning the
@@ -154,17 +174,20 @@ pub unsafe extern "C" fn unmap_buffer(
                 // the pinned VACodedBufferSegment is a stable borrow. Noop.
             }
         }
+        // Upload validates mapping state too; release this guard before it
+        // re-enters the image path for the same buffer.
+        drop(mapped);
         // If this buffer is the backing store of a derived VAImage bound to
         // a CUDA-resident surface, trigger the host→device upload now. This
         // is what unblocks ffmpeg's hwupload path on CPU-origin clients.
         if rec.buf_type == va::VAImageBufferType {
-            if let Some((image_ref, sk)) = pools
-                .images
-                .iter()
-                .find_map(|(_ik, ir)| {
-                    if ir.buffer_key == k { Some((ir, ir.surface_key?)) } else { None }
-                })
-            {
+            if let Some((image_ref, sk)) = pools.images.iter().find_map(|(_ik, ir)| {
+                if ir.buffer_key == k {
+                    Some((ir, ir.surface_key?))
+                } else {
+                    None
+                }
+            }) {
                 crate::driver::image::upload_image_to_surface(ctx, &pools, image_ref, sk)?;
             }
         }
@@ -182,20 +205,36 @@ pub unsafe extern "C" fn destroy_buffer(
         let mut pools = state.pools.lock();
         let k = pools
             .buffers
-            .find_by_low_bits(buffer_id as u32)
+            .find_by_low_bits(buffer_id)
             .ok_or(DriverError::InvalidBuffer)?;
+        if *pools.buffers[k].mapped.lock() {
+            return Err(DriverError::InvalidParameter);
+        }
         pools.buffers.remove(k);
         Ok(())
     })
 }
 
 pub unsafe extern "C" fn buffer_set_num_elements(
-    _ctx: va::VADriverContextP,
-    _buf_id: va::VABufferID,
-    _num_elements: u32,
+    ctx: va::VADriverContextP,
+    buf_id: va::VABufferID,
+    num_elements: u32,
 ) -> VAStatus {
-    // Rarely used by encoders; accept as no-op.
-    crate::error::VA_STATUS_SUCCESS
+    guard(|| {
+        // SAFETY: libva owns this live driver context.
+        let state = unsafe { state_from(ctx) }.ok_or(DriverError::InvalidParameter)?;
+        let mut pools = state.pools.lock();
+        let key = pools
+            .buffers
+            .find_by_low_bits(buf_id)
+            .ok_or(DriverError::InvalidBuffer)?;
+        let rec = &mut pools.buffers[key];
+        if *rec.mapped.lock() || num_elements > rec.allocated_elements {
+            return Err(DriverError::InvalidParameter);
+        }
+        rec.num_elements = num_elements;
+        Ok(())
+    })
 }
 
 pub unsafe extern "C" fn buffer_info(
@@ -211,14 +250,20 @@ pub unsafe extern "C" fn buffer_info(
         let pools = state.pools.lock();
         let k = pools
             .buffers
-            .find_by_low_bits(buf_id as u32)
+            .find_by_low_bits(buf_id)
             .ok_or(DriverError::InvalidBuffer)?;
         let rec = &pools.buffers[k];
         // SAFETY: out pointers owned by caller; null-guarded.
         unsafe {
-            if !typ.is_null() { *typ = rec.buf_type; }
-            if !size.is_null() { *size = rec.element_size; }
-            if !num_elements.is_null() { *num_elements = rec.num_elements; }
+            if !typ.is_null() {
+                *typ = rec.buf_type;
+            }
+            if !size.is_null() {
+                *size = rec.element_size;
+            }
+            if !num_elements.is_null() {
+                *num_elements = rec.num_elements;
+            }
         }
         Ok(())
     })

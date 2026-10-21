@@ -19,10 +19,8 @@
 //!    and UV plane) host → device.
 
 use super::{guard, state_from};
-use crate::driver::state::{
-    BufferRec, BufferStorage, DriverState, ImageRec, Pools, SurfaceKind,
-};
-use crate::error::{DriverError, VAStatus, VA_STATUS_SUCCESS};
+use crate::driver::state::{BufferRec, BufferStorage, DriverState, ImageRec, Pools, SurfaceKind};
+use crate::error::{DriverError, VA_STATUS_SUCCESS, VAStatus};
 use crate::ids::{BufferKey, ContainsKey, ImageKey, SurfaceKey, key_to_id};
 use core::ffi::{c_int, c_uint};
 use parking_lot::Mutex;
@@ -73,8 +71,7 @@ pub unsafe extern "C" fn create_image(
         let w = width as u32;
         let h = height as u32;
         let pitch = w; // tightly packed host buffer
-        let (image_out, _bk, _ik) =
-            alloc_host_image(state, None, w, h, pitch, fourcc)?;
+        let (image_out, _bk, _ik) = alloc_host_image(state, None, w, h, pitch, fourcc)?;
         // SAFETY: out pointer owned by caller.
         unsafe { *image = image_out };
         Ok(())
@@ -97,7 +94,7 @@ pub unsafe extern "C" fn derive_image(
             let pools = state.pools.lock();
             let sk = pools
                 .surfaces
-                .find_by_low_bits(surface as u32)
+                .find_by_low_bits(surface)
                 .ok_or(DriverError::InvalidSurface)?;
             let srec = &pools.surfaces[sk];
             if srec.format != va::VA_RT_FORMAT_YUV420 {
@@ -129,8 +126,12 @@ pub unsafe extern "C" fn destroy_image(
         let mut pools = state.pools.lock();
         let ik = pools
             .images
-            .find_by_low_bits(image_id as u32)
+            .find_by_low_bits(image_id)
             .ok_or(DriverError::InvalidImage)?;
+        let bk = pools.images[ik].buffer_key;
+        if pools.buffers.get(bk).is_some_and(|buf| *buf.mapped.lock()) {
+            return Err(DriverError::InvalidParameter);
+        }
         let rec = pools.images.remove(ik).ok_or(DriverError::InvalidImage)?;
         // Best-effort: also drop the backing data buffer. If the client
         // already destroyed it separately this is a no-op.
@@ -164,8 +165,14 @@ pub unsafe extern "C" fn put_image(
     ctx: va::VADriverContextP,
     surface: va::VASurfaceID,
     image: va::VAImageID,
-    sx: c_int, sy: c_int, sw: c_uint, sh: c_uint,
-    dx: c_int, dy: c_int, dw: c_uint, dh: c_uint,
+    sx: c_int,
+    sy: c_int,
+    sw: c_uint,
+    sh: c_uint,
+    dx: c_int,
+    dy: c_int,
+    dw: c_uint,
+    dh: c_uint,
 ) -> VAStatus {
     guard(|| {
         // SAFETY: ctx valid.
@@ -173,18 +180,23 @@ pub unsafe extern "C" fn put_image(
         let pools = state.pools.lock();
         let ik = pools
             .images
-            .find_by_low_bits(image as u32)
+            .find_by_low_bits(image)
             .ok_or(DriverError::InvalidImage)?;
         let sk = pools
             .surfaces
-            .find_by_low_bits(surface as u32)
+            .find_by_low_bits(surface)
             .ok_or(DriverError::InvalidSurface)?;
         let irec = &pools.images[ik];
         // Only accept full-frame, non-cropped puts for now. Partial puts
         // would require extra bookkeeping we do not yet need.
-        if sx != 0 || sy != 0 || dx != 0 || dy != 0
-            || sw != irec.width || sh != irec.height
-            || dw != irec.width || dh != irec.height
+        if sx != 0
+            || sy != 0
+            || dx != 0
+            || dy != 0
+            || sw != irec.width
+            || sh != irec.height
+            || dw != irec.width
+            || dh != irec.height
         {
             crate::logging::info(ctx, "put_image: partial/cropped puts not supported");
             return Err(DriverError::Unimplemented);
@@ -212,55 +224,83 @@ pub unsafe extern "C" fn create_subpicture(
     _ctx: va::VADriverContextP,
     _image: va::VAImageID,
     _subpicture: *mut va::VASubpictureID,
-) -> VAStatus { guard(|| Err(DriverError::Unimplemented)) }
+) -> VAStatus {
+    guard(|| Err(DriverError::Unimplemented))
+}
 
 pub unsafe extern "C" fn destroy_subpicture(
     _ctx: va::VADriverContextP,
     _subpicture: va::VASubpictureID,
-) -> VAStatus { guard(|| Err(DriverError::Unimplemented)) }
+) -> VAStatus {
+    guard(|| Err(DriverError::Unimplemented))
+}
 
 pub unsafe extern "C" fn set_subpicture_image(
     _ctx: va::VADriverContextP,
     _subpicture: va::VASubpictureID,
     _image: va::VAImageID,
-) -> VAStatus { guard(|| Err(DriverError::Unimplemented)) }
+) -> VAStatus {
+    guard(|| Err(DriverError::Unimplemented))
+}
 
 pub unsafe extern "C" fn set_subpicture_chromakey(
     _ctx: va::VADriverContextP,
     _subpicture: va::VASubpictureID,
-    _min: c_uint, _max: c_uint, _mask: c_uint,
-) -> VAStatus { guard(|| Err(DriverError::Unimplemented)) }
+    _min: c_uint,
+    _max: c_uint,
+    _mask: c_uint,
+) -> VAStatus {
+    guard(|| Err(DriverError::Unimplemented))
+}
 
 pub unsafe extern "C" fn set_subpicture_global_alpha(
     _ctx: va::VADriverContextP,
     _subpicture: va::VASubpictureID,
     _global_alpha: f32,
-) -> VAStatus { guard(|| Err(DriverError::Unimplemented)) }
+) -> VAStatus {
+    guard(|| Err(DriverError::Unimplemented))
+}
 
 pub unsafe extern "C" fn associate_subpicture(
     _ctx: va::VADriverContextP,
     _subpicture: va::VASubpictureID,
     _target_surfaces: *mut va::VASurfaceID,
     _num_surfaces: c_int,
-    _sx: i16, _sy: i16, _sw: u16, _sh: u16,
-    _dx: i16, _dy: i16, _dw: u16, _dh: u16,
+    _sx: i16,
+    _sy: i16,
+    _sw: u16,
+    _sh: u16,
+    _dx: i16,
+    _dy: i16,
+    _dw: u16,
+    _dh: u16,
     _flags: c_uint,
-) -> VAStatus { guard(|| Err(DriverError::Unimplemented)) }
+) -> VAStatus {
+    guard(|| Err(DriverError::Unimplemented))
+}
 
 pub unsafe extern "C" fn deassociate_subpicture(
     _ctx: va::VADriverContextP,
     _subpicture: va::VASubpictureID,
     _target_surfaces: *mut va::VASurfaceID,
     _num_surfaces: c_int,
-) -> VAStatus { guard(|| Err(DriverError::Unimplemented)) }
+) -> VAStatus {
+    guard(|| Err(DriverError::Unimplemented))
+}
 
 // libva also requires a vaPutSurface pointer (window-system rendering).
 pub unsafe extern "C" fn put_surface(
     _ctx: va::VADriverContextP,
     _surface: va::VASurfaceID,
     _draw: *mut core::ffi::c_void,
-    _srcx: i16, _srcy: i16, _srcw: u16, _srch: u16,
-    _destx: i16, _desty: i16, _destw: u16, _desth: u16,
+    _srcx: i16,
+    _srcy: i16,
+    _srcw: u16,
+    _srch: u16,
+    _destx: i16,
+    _desty: i16,
+    _destw: u16,
+    _desth: u16,
     _cliprects: *mut va::VARectangle,
     _number_cliprects: c_uint,
     _flags: c_uint,
@@ -274,23 +314,33 @@ pub unsafe extern "C" fn lock_surface(
     _ctx: va::VADriverContextP,
     _surface: va::VASurfaceID,
     _fourcc: *mut c_uint,
-    _ls: *mut c_uint, _cus: *mut c_uint, _cvs: *mut c_uint,
-    _lo: *mut c_uint, _cuo: *mut c_uint, _cvo: *mut c_uint,
+    _ls: *mut c_uint,
+    _cus: *mut c_uint,
+    _cvs: *mut c_uint,
+    _lo: *mut c_uint,
+    _cuo: *mut c_uint,
+    _cvo: *mut c_uint,
     _buffer_name: *mut c_uint,
     _buffer: *mut *mut core::ffi::c_void,
-) -> VAStatus { guard(|| Err(DriverError::Unimplemented)) }
+) -> VAStatus {
+    guard(|| Err(DriverError::Unimplemented))
+}
 
 pub unsafe extern "C" fn unlock_surface(
     _ctx: va::VADriverContextP,
     _surface: va::VASurfaceID,
-) -> VAStatus { guard(|| Err(DriverError::Unimplemented)) }
+) -> VAStatus {
+    guard(|| Err(DriverError::Unimplemented))
+}
 
 pub unsafe extern "C" fn query_surface_error(
     _ctx: va::VADriverContextP,
     _surface: va::VASurfaceID,
     _error_status: VAStatus,
     _error_info: *mut *mut core::ffi::c_void,
-) -> VAStatus { guard(|| Err(DriverError::Unimplemented)) }
+) -> VAStatus {
+    guard(|| Err(DriverError::Unimplemented))
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -308,14 +358,20 @@ fn alloc_host_image(
     fourcc: u32,
 ) -> Result<(va::VAImage, BufferKey, ImageKey), DriverError> {
     debug_assert_eq!(fourcc, va::VA_FOURCC_NV12);
-    let y_size = (pitch as usize).checked_mul(height as usize)
+    let y_size = (pitch as usize)
+        .checked_mul(height as usize)
         .ok_or(DriverError::InvalidParameter)?;
-    let uv_size = (pitch as usize).checked_mul((height as usize) / 2)
+    let uv_size = (pitch as usize)
+        .checked_mul((height as usize) / 2)
         .ok_or(DriverError::InvalidParameter)?;
-    let total = y_size.checked_add(uv_size).ok_or(DriverError::InvalidParameter)?;
+    let total = y_size
+        .checked_add(uv_size)
+        .ok_or(DriverError::InvalidParameter)?;
 
     let mut bytes: Vec<u8> = Vec::new();
-    bytes.try_reserve_exact(total).map_err(|_| DriverError::AllocFailed)?;
+    bytes
+        .try_reserve_exact(total)
+        .map_err(|_| DriverError::AllocFailed)?;
     bytes.resize(total, 0);
 
     let mut pools = state.pools.lock();
@@ -323,9 +379,11 @@ fn alloc_host_image(
         buf_type: va::VAImageBufferType,
         element_size: total as u32,
         num_elements: 1,
+        allocated_elements: 1,
         storage: BufferStorage::Generic(Mutex::new(bytes)),
         coded_ready: Mutex::new(false),
-    });
+        mapped: Mutex::new(false),
+    })?;
     let pitches = [pitch, pitch, 0];
     let offsets = [0u32, y_size as u32, 0];
     let ik: ImageKey = pools.images.insert(ImageRec {
@@ -337,7 +395,7 @@ fn alloc_host_image(
         offsets,
         data_size: total as u32,
         buffer_key: bk,
-    });
+    })?;
 
     let image_id = key_to_id(ik) as va::VAImageID;
     let buf_id = key_to_id(bk) as va::VABufferID;
@@ -381,13 +439,25 @@ pub(crate) fn upload_image_to_surface(
     image: &ImageRec,
     surface_key: SurfaceKey,
 ) -> Result<(), DriverError> {
+    // Buffer bytes.
+    let brec = pools
+        .buffers
+        .get(image.buffer_key)
+        .ok_or(DriverError::InvalidBuffer)?;
+    if *brec.mapped.lock() {
+        return Err(DriverError::InvalidParameter);
+    }
     let srec = pools
         .surfaces
         .get(surface_key)
         .ok_or(DriverError::InvalidSurface)?;
     let (cu_ptr, surf_pitch, surf_w, surf_h) = match &srec.kind {
-        SurfaceKind::Internal { cu_ptr, pitch, width, height } =>
-            (*cu_ptr, *pitch, *width, *height),
+        SurfaceKind::Internal {
+            cu_ptr,
+            pitch,
+            width,
+            height,
+        } => (*cu_ptr, *pitch, *width, *height),
         _ => {
             crate::logging::info(ctx, "upload_image_to_surface: non-CUDA surface, skipping");
             return Ok(());
@@ -401,11 +471,6 @@ pub(crate) fn upload_image_to_surface(
         .as_ref()
         .ok_or(DriverError::OperationFailed("surface has no CUDA context"))?;
 
-    // Buffer bytes.
-    let brec = pools
-        .buffers
-        .get(image.buffer_key)
-        .ok_or(DriverError::InvalidBuffer)?;
     let bytes_mtx = brec.storage.bytes();
     let bytes = bytes_mtx.lock();
     if bytes.len() < image.data_size as usize {
@@ -417,7 +482,7 @@ pub(crate) fn upload_image_to_surface(
         .map_err(|_| DriverError::OperationFailed("cuda bind_to_thread"))?;
 
     use cudarc::driver::sys::{
-        cuMemcpy2D_v2, CUDA_MEMCPY2D_st, CUdeviceptr, CUmemorytype, CUresult,
+        CUDA_MEMCPY2D_st, CUdeviceptr, CUmemorytype, CUresult, cuMemcpy2D_v2,
     };
 
     let host_y = bytes.as_ptr();
@@ -453,7 +518,7 @@ pub(crate) fn upload_image_to_surface(
     }
 
     // UV plane.
-    let uv_dst = (cu_ptr as u64)
+    let uv_dst = cu_ptr
         .checked_add((surf_pitch as u64) * (surf_h as u64))
         .ok_or(DriverError::InvalidParameter)?;
     let uv_copy = CUDA_MEMCPY2D_st {
