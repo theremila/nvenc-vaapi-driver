@@ -6,6 +6,12 @@ use std::fs::File;
 use std::os::fd::AsRawFd;
 use va_sys as va;
 
+#[repr(C)]
+struct Misc<T> {
+    kind: u32,
+    params: T,
+}
+
 struct Driver {
     ctx: Box<va::VADriverContext>,
     vt: Box<va::VADriverVTable>,
@@ -187,11 +193,34 @@ fn dynamic_rate_control_two_contexts_and_surface_lifetime() {
             }
             ids.push(d.buffer(contexts[i], va::VAEncPictureParameterBufferType, &mut pic));
             // Small deltas every frame plus large changes and fractional FPS.
-            let mut rc = [
-                1u32,
-                [1_000_000, 3_000_000, 500_000][(frame / 60) % 3] + frame as u32,
-            ];
+            let mut rc = Misc {
+                kind: va::VAEncMiscParameterTypeRateControl,
+                params: unsafe { std::mem::zeroed::<va::VAEncMiscParameterRateControl>() },
+            };
+            // Reset once without changing any configuration values.
+            let rate_frame = if frame == 100 { 99 } else { frame };
+            rc.params.bits_per_second =
+                [1_000_000, 3_000_000, 500_000][(rate_frame / 60) % 3] + rate_frame as u32;
+            rc.params.target_percentage = 100;
+            rc.params.window_size = 1500;
+            rc.params.initial_qp = if i == 0 { 26 } else { 35 };
+            rc.params.min_qp = if i == 0 { 1 } else { 35 };
+            rc.params.max_qp = if i == 0 { 42 } else { 35 };
+            unsafe {
+                rc.params
+                    .rc_flags
+                    .bits
+                    .as_mut()
+                    .set_reset(u32::from(frame == 100))
+            };
+            let mut hrd = Misc {
+                kind: va::VAEncMiscParameterTypeHRD,
+                params: unsafe { std::mem::zeroed::<va::VAEncMiscParameterHRD>() },
+            };
+            hrd.params.buffer_size = rc.params.bits_per_second * 3 / 2;
+            hrd.params.initial_buffer_fullness = hrd.params.buffer_size / 2;
             ids.push(d.buffer(contexts[i], va::VAEncMiscParameterBufferType, &mut rc));
+            ids.push(d.buffer(contexts[i], va::VAEncMiscParameterBufferType, &mut hrd));
             let mut fps = [
                 0u32,
                 if frame < 90 {
@@ -222,10 +251,17 @@ fn dynamic_rate_control_two_contexts_and_surface_lifetime() {
                 assert_eq!(d.vt.vaMapBuffer.unwrap()(ctx, coded[i], &mut ptr), 0);
                 let segment = &*ptr.cast::<va::VACodedBufferSegment>();
                 assert!(segment.size > 0, "empty frame {frame}");
-                output[i].extend_from_slice(std::slice::from_raw_parts(
-                    segment.buf.cast::<u8>(),
-                    segment.size as usize,
-                ));
+                let bytes =
+                    std::slice::from_raw_parts(segment.buf.cast::<u8>(), segment.size as usize);
+                if frame == 100 {
+                    assert!(
+                        bytes
+                            .windows(4)
+                            .any(|w| w[..3] == [0, 0, 1] && w[3] & 31 == 5),
+                        "rate-control reset did not produce an IDR"
+                    );
+                }
+                output[i].extend_from_slice(bytes);
                 assert_eq!(d.vt.vaUnmapBuffer.unwrap()(ctx, coded[i]), 0);
                 for id in ids {
                     assert_eq!(d.vt.vaDestroyBuffer.unwrap()(ctx, id), 0);
@@ -292,6 +328,43 @@ fn dynamic_rate_control_two_contexts_and_surface_lifetime() {
             String::from_utf8_lossy(&probe.stdout).trim(),
             frames.to_string()
         );
+        if i == 1 {
+            let trace = std::process::Command::new("ffmpeg")
+                .args(["-hide_banner", "-loglevel", "info", "-i"])
+                .arg(&path)
+                .args(["-c:v", "copy", "-bsf:v", "trace_headers", "-f", "null", "-"])
+                .output()
+                .unwrap();
+            assert!(trace.status.success());
+            let mut base_qp = None;
+            let mut slice_count = 0;
+            for line in String::from_utf8_lossy(&trace.stderr).lines() {
+                if line.contains("pic_init_qp_minus26") {
+                    base_qp = Some(
+                        line.split_whitespace()
+                            .last()
+                            .unwrap()
+                            .parse::<i32>()
+                            .unwrap()
+                            + 26,
+                    );
+                } else if line.contains("slice_qp_delta") {
+                    let delta = line
+                        .split_whitespace()
+                        .last()
+                        .unwrap()
+                        .parse::<i32>()
+                        .unwrap();
+                    assert_eq!(
+                        base_qp.unwrap() + delta,
+                        35,
+                        "client QP limits ignored: {line}"
+                    );
+                    slice_count += 1;
+                }
+            }
+            assert_eq!(slice_count, frames);
+        }
         std::fs::remove_file(path).unwrap();
     }
 }
@@ -555,7 +628,12 @@ fn queued_outputs_keep_picture_identity_after_resource_destruction() {
     let mut config = va::VA_INVALID_ID;
     let mut context = va::VA_INVALID_ID;
     let mut surfaces = [va::VA_INVALID_SURFACE; 4];
-    let mut coded = [va::VA_INVALID_ID; 12];
+    let frames: usize = std::env::var("NVENC_TEST_QUEUED_FRAMES")
+        .unwrap_or_else(|_| "12".into())
+        .parse()
+        .unwrap();
+    assert!((12..=600).contains(&frames));
+    let mut coded = vec![va::VA_INVALID_ID; frames];
     // SAFETY: arrays and parameter structs remain live and are sized as passed.
     unsafe {
         assert_eq!(
@@ -595,6 +673,7 @@ fn queued_outputs_keep_picture_identity_after_resource_destruction() {
             ),
             0
         );
+        let started = std::time::Instant::now();
         for (frame, output) in coded.iter_mut().enumerate() {
             assert_eq!(
                 d.vt.vaCreateBuffer.unwrap()(
@@ -620,7 +699,7 @@ fn queued_outputs_keep_picture_identity_after_resource_destruction() {
             bytes.fill(128);
             for y in 0..288usize {
                 bytes[y * image.pitches[0] as usize..y * image.pitches[0] as usize + 512]
-                    .fill(24 + frame as u8 * 16);
+                    .fill(24 + (frame % 12) as u8 * 16);
             }
             assert_eq!(d.vt.vaUnmapBuffer.unwrap()(ctx, image.buf), 0);
             assert_eq!(d.vt.vaDestroyImage.unwrap()(ctx, image.image_id), 0);
@@ -640,6 +719,14 @@ fn queued_outputs_keep_picture_identity_after_resource_destruction() {
             picture.pic_init_qp = 28;
             picture.pic_fields.bits.as_mut().set_idr_pic_flag(1);
             params.push(d.buffer(context, va::VAEncPictureParameterBufferType, &mut picture));
+            // Change rates while earlier outputs may still be queued.
+            let mut rc = Misc {
+                kind: va::VAEncMiscParameterTypeRateControl,
+                params: std::mem::zeroed::<va::VAEncMiscParameterRateControl>(),
+            };
+            rc.params.bits_per_second = 5_000_000 + frame as u32 * 1000;
+            rc.params.target_percentage = 100;
+            params.push(d.buffer(context, va::VAEncMiscParameterBufferType, &mut rc));
             assert_eq!(d.vt.vaBeginPicture.unwrap()(ctx, context, surface), 0);
             assert_eq!(
                 d.vt.vaRenderPicture.unwrap()(
@@ -661,9 +748,17 @@ fn queued_outputs_keep_picture_identity_after_resource_destruction() {
             );
             assert!(status == va::VASurfaceReady || status == va::VASurfaceRendering);
         }
-        let poll = d.vt.vaSyncBuffer.unwrap()(ctx, coded[11], 0);
+        let last = *coded.last().unwrap();
+        let poll = d.vt.vaSyncBuffer.unwrap()(ctx, last, 0);
         assert!(poll == 0 || poll == va::VA_STATUS_ERROR_TIMEDOUT as i32);
-        assert_eq!(d.vt.vaSyncBuffer.unwrap()(ctx, coded[11], 5_000_000_000), 0);
+        assert_eq!(d.vt.vaSyncBuffer.unwrap()(ctx, last, 5_000_000_000), 0);
+        eprintln!(
+            "queued-rate-updates {}",
+            serde_json::json!({
+                "frames": frames, "elapsed_s": started.elapsed().as_secs_f64(),
+                "width": 512, "height": 288,
+            })
+        );
         // Input allocations, registrations and encoder can disappear while the
         // original coded buffers retain independently owned, matching bytes.
         assert_eq!(
@@ -671,54 +766,43 @@ fn queued_outputs_keep_picture_identity_after_resource_destruction() {
             0
         );
         assert_eq!(d.vt.vaDestroyContext.unwrap()(ctx, context), 0);
+        let mut encoded = vec![Vec::new(); frames];
         for (frame, output) in coded.iter().enumerate().rev() {
             let mut ptr = std::ptr::null_mut();
             assert_eq!(d.vt.vaMapBuffer.unwrap()(ctx, *output, &mut ptr), 0);
             let segment = &*ptr.cast::<va::VACodedBufferSegment>();
-            let bytes = std::slice::from_raw_parts(segment.buf.cast::<u8>(), segment.size as usize)
-                .to_vec();
+            encoded[frame] =
+                std::slice::from_raw_parts(segment.buf.cast::<u8>(), segment.size as usize)
+                    .to_vec();
             assert_eq!(d.vt.vaUnmapBuffer.unwrap()(ctx, *output), 0);
-            let mut child = std::process::Command::new("ffmpeg")
-                .args([
-                    "-v",
-                    "error",
-                    "-f",
-                    "h264",
-                    "-i",
-                    "pipe:0",
-                    "-frames:v",
-                    "1",
-                    "-pix_fmt",
-                    "nv12",
-                    "-f",
-                    "rawvideo",
-                    "pipe:1",
-                ])
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .spawn()
-                .unwrap();
-            use std::io::Write;
-            child.stdin.take().unwrap().write_all(&bytes).unwrap();
-            let decoded = child.wait_with_output().unwrap();
-            assert!(
-                decoded.status.success(),
-                "{}",
-                String::from_utf8_lossy(&decoded.stderr)
-            );
-            assert!(decoded.stderr.is_empty());
-            assert_eq!(decoded.stdout.len(), 512 * 288 * 3 / 2);
-            let mean = decoded.stdout[..512 * 288]
+            assert_eq!(d.vt.vaDestroyBuffer.unwrap()(ctx, *output), 0);
+        }
+        let path = std::env::temp_dir().join(format!("nvenc_queued_{}.h264", std::process::id()));
+        std::fs::write(&path, encoded.concat()).unwrap();
+        let decoded = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-xerror", "-f", "h264", "-i"])
+            .arg(&path)
+            .args(["-pix_fmt", "nv12", "-f", "rawvideo", "pipe:1"])
+            .output()
+            .unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert!(
+            decoded.status.success(),
+            "{}",
+            String::from_utf8_lossy(&decoded.stderr)
+        );
+        assert!(decoded.stderr.is_empty());
+        assert_eq!(decoded.stdout.len(), frames * 512 * 288 * 3 / 2);
+        for (frame, pixels) in decoded.stdout.chunks_exact(512 * 288 * 3 / 2).enumerate() {
+            let mean = pixels[..512 * 288]
                 .iter()
                 .map(|&y| u64::from(y))
                 .sum::<u64>() as f64
                 / (512.0 * 288.0);
             assert!(
-                (mean - (24 + frame * 16) as f64).abs() <= 2.0,
+                (mean - (24 + (frame % 12) * 16) as f64).abs() <= 2.0,
                 "wrong output: frame={frame}, mean={mean}"
             );
-            assert_eq!(d.vt.vaDestroyBuffer.unwrap()(ctx, *output), 0);
         }
         assert_eq!(d.vt.vaDestroyConfig.unwrap()(ctx, config), 0);
     }

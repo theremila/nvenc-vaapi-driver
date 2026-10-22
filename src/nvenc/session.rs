@@ -60,6 +60,7 @@ impl NvencSession {
         cuda: Arc<cudarc::driver::CudaContext>,
         cfg: EncoderConfig,
     ) -> Result<Self, DriverError> {
+        cfg.validate_rate_control()?;
         // Ensure CUDA context is current on this thread before NVENC touches it.
         cuda.bind_to_thread()
             .map_err(|_| DriverError::OperationFailed("cuda bind_to_thread"))?;
@@ -339,28 +340,25 @@ impl NvencSession {
         self.output.surface_ready(key)
     }
 
-    /// Best-effort runtime reconfiguration. On failure we keep the old config
-    /// — a full drop-and-recreate is left for a later slice.
-    ///
-    /// `force_idr` controls whether the next frame is forced to an IDR.
-    /// Pass `true` on changes that require decoder resync (profile change,
-    /// resolution change, SPS-driven reconfigure). Pass `false` for pure
-    /// bitrate/framerate updates — Chromium's WebRTC RateController emits
-    /// these on every frame, and forcing IDR every time produces an
-    /// all-keyframe stream which WebRTC interprets as a malfunctioning
-    /// encoder and cycles out of its trial window.
+    /// Reconfigure without reopening the encoder. Explicit rate-control resets
+    /// also start a new IDR; ordinary bitrate/FPS updates preserve references.
     pub fn reconfigure(
         &mut self,
         new_cfg: EncoderConfig,
-        force_idr: bool,
+        reset_rate_control: bool,
     ) -> Result<(), DriverError> {
-        if new_cfg == self.config {
+        new_cfg.validate_rate_control()?;
+        if new_cfg == self.config && !reset_rate_control {
             return Ok(());
         }
         self._cuda_ctx
             .bind_to_thread()
             .map_err(|_| DriverError::OperationFailed("cuda bind_to_thread"))?;
-        self.output.wait_all()?;
+        // NVENC supports rate changes with pictures in flight. Preserve the
+        // queue for these updates; resets and coding-tool changes still drain.
+        if reset_rate_control || !new_cfg.is_rate_update_from(&self.config) {
+            self.output.wait_all()?;
+        }
         let api = api::get()?;
 
         // Preserve the successful preset configuration. A bitrate update
@@ -372,8 +370,9 @@ impl NvencSession {
             unsafe { MaybeUninit::zeroed().assume_init() };
         recfg.version = nv::NV_ENC_RECONFIGURE_PARAMS_VER;
         recfg.reInitEncodeParams = reinit;
-        if force_idr {
+        if reset_rate_control {
             recfg.set_forceIDR(1);
+            recfg.set_resetEncoder(1);
         }
         // SAFETY: encoder valid; recfg self-contained except reInitEncodeParams
         // which references encode_config, which outlives this call.

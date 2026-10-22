@@ -13,6 +13,57 @@
 
 use va_sys as va;
 
+/// Client rate-control settings, independent of the hardware backend.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct RateControlParams {
+    pub bits_per_second: u32,
+    pub target_percentage: u32,
+    pub window_size_ms: u32,
+    pub initial_qp: u32,
+    pub min_qp: u32,
+    pub max_qp: u32,
+    pub reset: bool,
+}
+
+/// Parse the payload following the misc-parameter type tag.
+pub fn parse_rate_control(bytes: &[u8]) -> Option<RateControlParams> {
+    if bytes.len() < core::mem::size_of::<va::VAEncMiscParameterRateControl>() {
+        return None;
+    }
+    // SAFETY: checked size; this VA struct contains only integer/bitfield POD.
+    let rc = unsafe {
+        bytes
+            .as_ptr()
+            .cast::<va::VAEncMiscParameterRateControl>()
+            .read_unaligned()
+    };
+    Some(RateControlParams {
+        bits_per_second: rc.bits_per_second,
+        target_percentage: rc.target_percentage,
+        window_size_ms: rc.window_size,
+        initial_qp: rc.initial_qp,
+        min_qp: rc.min_qp,
+        max_qp: rc.max_qp,
+        // SAFETY: every bit pattern is valid for this integer bitfield view.
+        reset: unsafe { rc.rc_flags.bits.as_ref().reset() != 0 },
+    })
+}
+
+/// Return HRD buffer size and initial fullness, in bits.
+pub fn parse_hrd(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.len() < core::mem::size_of::<va::VAEncMiscParameterHRD>() {
+        return None;
+    }
+    // SAFETY: checked size; the VA HRD payload contains only integer POD.
+    let hrd = unsafe {
+        bytes
+            .as_ptr()
+            .cast::<va::VAEncMiscParameterHRD>()
+            .read_unaligned()
+    };
+    Some((hrd.buffer_size, hrd.initial_buffer_fullness))
+}
+
 /// Projection of an H.264 SPS buffer into the subset we forward to NVENC.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct EncoderConfig {
@@ -146,6 +197,42 @@ mod tests {
         unsafe {
             core::slice::from_raw_parts((t as *const T) as *const u8, core::mem::size_of::<T>())
         }
+    }
+
+    #[test]
+    fn rate_controls_parse_unaligned_and_reject_truncation() {
+        // SAFETY: VA misc controls contain only integer POD.
+        let mut rc: va::VAEncMiscParameterRateControl = unsafe { core::mem::zeroed() };
+        rc.bits_per_second = 3_000_000;
+        rc.target_percentage = 75;
+        rc.window_size = 1500;
+        rc.initial_qp = 26;
+        rc.min_qp = 10;
+        rc.max_qp = 42;
+        // SAFETY: integer bitfield view of the initialised VA union.
+        unsafe { rc.rc_flags.bits.as_mut().set_reset(1) };
+        let mut unaligned = vec![0];
+        unaligned.extend_from_slice(bytes_of(&rc));
+        let parsed = parse_rate_control(&unaligned[1..]).unwrap();
+        assert_eq!(
+            parsed,
+            RateControlParams {
+                bits_per_second: 3_000_000,
+                target_percentage: 75,
+                window_size_ms: 1500,
+                initial_qp: 26,
+                min_qp: 10,
+                max_qp: 42,
+                reset: true,
+            }
+        );
+        assert!(parse_rate_control(&unaligned[2..]).is_none());
+        // SAFETY: HRD struct is integer POD.
+        let mut hrd: va::VAEncMiscParameterHRD = unsafe { core::mem::zeroed() };
+        hrd.buffer_size = 4_500_000;
+        hrd.initial_buffer_fullness = 2_250_000;
+        assert_eq!(parse_hrd(bytes_of(&hrd)), Some((4_500_000, 2_250_000)));
+        assert!(parse_hrd(&bytes_of(&hrd)[1..]).is_none());
     }
 
     #[test]

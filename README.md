@@ -8,6 +8,8 @@ There is no background daemon and no application-specific routing.
 
 - H.264 Constrained Baseline, Main and High; progressive NV12 input.
 - CBR, VBR and constant QP, dynamic bitrate and rational frame rate.
+- Client-supplied initial/minimum/maximum QP, rate-control windows and HRD
+  buffer size/fullness for bitrate-based encoding.
 - CUDA-resident input allocation and CPU upload through VA images.
 - NV12 image readback, including chroma-aligned crops, and explicit read/write
   mapping access for internal CUDA surfaces.
@@ -19,6 +21,13 @@ HEVC/AV1, arbitrary packed-header passthrough or surface export. PRIME import
 accepts a restricted linear NV12 layout; end-to-end compositor DMA-BUF
 interoperability needs separate validation. General Wayland/Electron sandbox
 compatibility and a combined decode/encode dispatcher remain unfinished.
+
+Rate controls apply to any VA-API client. Explicit HRD buffering takes
+precedence over the rate-control window; omitted controls use backend defaults.
+A maximum QP limits compression and can cause bitrate overshoot on complex
+scenes, as permitted by VA-API. It cannot guarantee sharp output within every
+bitrate budget. Ordinary bitrate/FPS updates preserve queued output; explicit
+rate-control resets drain the queue and request an IDR.
 
 Applications must actually select VA-API H.264 encoding. A libva backend cannot
 redirect software encoders that never call libva. Application build options,

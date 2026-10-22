@@ -15,7 +15,7 @@ use crate::driver::state::{BufferStorage, SurfaceKind};
 use crate::error::{DriverError, VAStatus};
 use crate::h264;
 use crate::ids::{ContainsKey, SurfaceKey};
-use crate::nvenc::h264_config::{EncoderConfig, H264Profile};
+use crate::nvenc::h264_config::{EncoderConfig, H264Profile, HrdBuffer};
 use core::ffi::c_int;
 use va_sys as va;
 
@@ -91,15 +91,11 @@ pub unsafe extern "C" fn render_picture(
                 .checked_mul(brec.num_elements as usize)
                 .ok_or(DriverError::InvalidParameter)?;
             let storage = brec.storage.bytes().lock();
-            let data = storage
-                .get(..len)
-                .ok_or(DriverError::InvalidParameter)?
-                .to_vec();
-            drop(storage);
+            let data = storage.get(..len).ok_or(DriverError::InvalidParameter)?;
             match brec.buf_type {
-                va::VAEncSequenceParameterBufferType => pending.seq_param = Some(data),
-                va::VAEncPictureParameterBufferType => pending.pic_param = Some(data),
-                va::VAEncSliceParameterBufferType => pending.slice_param = Some(data),
+                va::VAEncSequenceParameterBufferType => pending.seq_param = Some(data.to_vec()),
+                va::VAEncPictureParameterBufferType => pending.pic_param = Some(data.to_vec()),
+                va::VAEncSliceParameterBufferType => pending.slice_param = Some(data.to_vec()),
                 va::VAEncPackedHeaderParameterBufferType => {
                     // Pair marker: the very next PackedHeaderDataBuffer
                     // carries the bytes whose NAL kind this param announces.
@@ -114,7 +110,7 @@ pub unsafe extern "C" fn render_picture(
                             crate::driver::state::PackedHeaderKind::from_va_type(va_type);
                     }
                     // Legacy tuple form, kept until all read sites migrate.
-                    pending.packed_headers.push((brec.buf_type, data));
+                    pending.packed_headers.push((brec.buf_type, data.to_vec()));
                 }
                 va::VAEncPackedHeaderDataBufferType => {
                     if let Some(kind) = pending.pending_packed_kind.take() {
@@ -122,22 +118,15 @@ pub unsafe extern "C" fn render_picture(
                             .packed_headers_typed
                             .push(crate::driver::state::PackedHeader {
                                 kind,
-                                bytes: data.clone(),
+                                bytes: data.to_vec(),
                             });
                     }
                     // Legacy form.
-                    pending.packed_headers.push((brec.buf_type, data));
+                    pending.packed_headers.push((brec.buf_type, data.to_vec()));
                 }
                 va::VAEncCodedBufferType => pending.coded_buf = Some(bk),
                 va::VAEncMiscParameterBufferType => {
-                    // Layout: u32 `type_` followed by subtype struct.
-                    // Chromium/WebRTC uses this channel heavily to drive
-                    // dynamic bitrate (RateControl, type=1) and
-                    // framerate (type=0) changes. Ignoring it means
-                    // NVENC stays on our default bitrate regardless of
-                    // what Chromium's RateController asked for — the
-                    // root cause of the 4-frame-then-cycle behaviour
-                    // observed in Vesktop screen share.
+                    // Borrow transient controls; only retained parameters need a copy.
                     if data.len() < core::mem::size_of::<u32>() {
                         continue;
                     }
@@ -162,22 +151,19 @@ pub unsafe extern "C" fn render_picture(
                                 }
                             }
                         }
-                        // VAEncMiscParameterTypeRateControl = 1: next u32
-                        // is `bits_per_second`.
-                        1 if data.len() >= 8 => {
-                            let mut b = [0u8; 4];
-                            b.copy_from_slice(&data[4..8]);
-                            let bps = u32::from_ne_bytes(b);
-                            if bps > 0 {
-                                pending.misc_bitrate_bps = Some(bps);
-                            }
-                            if data.len() >= 12 {
-                                b.copy_from_slice(&data[8..12]);
-                                pending.misc_target_percentage = Some(u32::from_ne_bytes(b));
-                            }
+                        va::VAEncMiscParameterTypeRateControl => {
+                            pending.misc_rate_control = Some(
+                                h264::parse_rate_control(&data[4..])
+                                    .ok_or(DriverError::InvalidParameter)?,
+                            );
+                        }
+                        va::VAEncMiscParameterTypeHRD => {
+                            pending.misc_hrd = Some(
+                                h264::parse_hrd(&data[4..]).ok_or(DriverError::InvalidParameter)?,
+                            );
                         }
                         _ => {
-                            // HRD, MaxSliceSize, AIR, MaxFrameSize, etc.
+                            // MaxSliceSize, AIR, MaxFrameSize, etc.
                             // Not yet modeled — NVENC will operate on
                             // the current rate-control state.
                         }
@@ -214,8 +200,8 @@ pub unsafe extern "C" fn end_picture(
         let seq_bytes = pending.seq_param.take();
         let coded_buf_key = pending.coded_buf.take();
         pending.packed_headers_typed.clear();
-        let misc_bitrate = pending.misc_bitrate_bps.take();
-        let misc_target_percentage = pending.misc_target_percentage.take();
+        let misc_rate_control = pending.misc_rate_control.take();
+        let misc_hrd = pending.misc_hrd.take();
         let misc_fps = pending.misc_fps.take();
         pending.slice_param = None;
         pending.packed_headers.clear();
@@ -274,18 +260,33 @@ pub unsafe extern "C" fn end_picture(
             new_cfg = build_cfg_from_sps(&sps, profile, &new_cfg);
         }
         // Misc parameters override the sequence's initial rate-control values.
-        if let Some(bitrate) = misc_bitrate {
-            new_cfg.bitrate_bps = bitrate;
-            new_cfg.max_bitrate_bps = bitrate;
-        }
-        if matches!(new_cfg.rc_mode, crate::nvenc::preset::RcMode::Vbr) {
-            if let Some(percent) = misc_target_percentage {
-                if percent == 0 || percent > 100 {
+        if let Some(rc) = misc_rate_control {
+            if rc.bits_per_second > 0 {
+                new_cfg.bitrate_bps = rc.bits_per_second;
+                new_cfg.max_bitrate_bps = rc.bits_per_second;
+            }
+            if matches!(new_cfg.rc_mode, crate::nvenc::preset::RcMode::Vbr) {
+                if rc.target_percentage == 0 || rc.target_percentage > 100 {
                     return Err(DriverError::InvalidParameter);
                 }
-                new_cfg.bitrate_bps =
-                    ((u64::from(new_cfg.max_bitrate_bps) * u64::from(percent)) / 100) as u32;
+                new_cfg.bitrate_bps = ((u64::from(new_cfg.max_bitrate_bps)
+                    * u64::from(rc.target_percentage))
+                    / 100) as u32;
             }
+            new_cfg.initial_qp = rc.initial_qp;
+            new_cfg.min_qp = rc.min_qp;
+            new_cfg.max_qp = rc.max_qp;
+            new_cfg.window_size_ms = rc.window_size_ms;
+        }
+        if let Some((size_bits, initial_fullness_bits)) = misc_hrd {
+            new_cfg.hrd = if size_bits == 0 && initial_fullness_bits == 0 {
+                None
+            } else {
+                Some(HrdBuffer {
+                    size_bits,
+                    initial_fullness_bits,
+                })
+            };
         }
         if let Some((num, den)) = misc_fps {
             new_cfg.fps_num = num;
@@ -297,8 +298,9 @@ pub unsafe extern "C" fn end_picture(
             }
             new_cfg.qp = pic_params.pic_init_qp;
         }
+        new_cfg.validate_rate_control()?;
         if let Some(session) = session_guard.as_mut() {
-            session.reconfigure(new_cfg, false)?;
+            session.reconfigure(new_cfg, misc_rate_control.is_some_and(|rc| rc.reset))?;
         } else {
             // Wait for the client's actual SPS/RC before opening NVENC. This
             // avoids an expensive reconfigure immediately after initialisation.
@@ -505,6 +507,15 @@ mod tests {
             };
             self.buffer(va::VAEncPictureParameterBufferType, bytes)
         }
+
+        fn misc<T>(&mut self, kind: u32, params: &T) -> va::VABufferID {
+            let mut bytes = kind.to_ne_bytes().to_vec();
+            // SAFETY: callers use fully initialised VA integer-POD controls.
+            bytes.extend_from_slice(unsafe {
+                core::slice::from_raw_parts((params as *const T).cast(), core::mem::size_of::<T>())
+            });
+            self.buffer(va::VAEncMiscParameterBufferType, &bytes)
+        }
     }
 
     #[test]
@@ -537,6 +548,66 @@ mod tests {
         assert_ne!(f.render(&mut [id]), 0);
         assert_eq!(unsafe { buffer::unmap_buffer(&mut *f.ctx, id) }, 0);
         assert_eq!(f.render(&mut [id]), 0);
+    }
+
+    #[test]
+    fn complete_rate_controls_are_retained_and_truncated_payloads_rejected() {
+        let mut f = Fixture::new();
+        // SAFETY: these VA control structs contain only integer POD.
+        let mut rc: va::VAEncMiscParameterRateControl = unsafe { core::mem::zeroed() };
+        let mut hrd: va::VAEncMiscParameterHRD = unsafe { core::mem::zeroed() };
+        rc.bits_per_second = 3_000_000;
+        rc.initial_qp = 26;
+        rc.min_qp = 10;
+        rc.max_qp = 42;
+        rc.window_size = 1500;
+        hrd.buffer_size = 4_500_000;
+        hrd.initial_buffer_fullness = 2_250_000;
+        let rc_id = f.misc(va::VAEncMiscParameterTypeRateControl, &rc);
+        let hrd_id = f.misc(va::VAEncMiscParameterTypeHRD, &hrd);
+        assert_eq!(f.begin(), 0);
+        assert_eq!(f.render(&mut [rc_id, hrd_id]), 0);
+        {
+            let pools = f.state.pools.lock();
+            let key = pools.contexts.find_by_low_bits(f.context).unwrap();
+            let pending = pools.contexts[key].pending.lock();
+            let rc = pending.misc_rate_control.unwrap();
+            assert_eq!(
+                (rc.initial_qp, rc.min_qp, rc.max_qp, rc.window_size_ms),
+                (26, 10, 42, 1500)
+            );
+            assert_eq!(pending.misc_hrd, Some((4_500_000, 2_250_000)));
+        }
+        let short_rc = f.buffer(va::VAEncMiscParameterBufferType, &[1, 0, 0, 0, 0, 0, 0, 0]);
+        let short_hrd = f.buffer(va::VAEncMiscParameterBufferType, &[5, 0, 0, 0]);
+        assert_eq!(
+            f.render(&mut [short_rc]),
+            va::VA_STATUS_ERROR_INVALID_PARAMETER as VAStatus
+        );
+        assert_eq!(
+            f.render(&mut [short_hrd]),
+            va::VA_STATUS_ERROR_INVALID_PARAMETER as VAStatus
+        );
+    }
+
+    #[test]
+    fn invalid_qp_limits_fail_before_creating_a_cuda_session() {
+        let mut f = Fixture::new();
+        let coded = f.buffer(va::VAEncCodedBufferType, &[0; 64]);
+        let pps = f.pps(coded);
+        // SAFETY: VA rate control is integer POD.
+        let mut rc: va::VAEncMiscParameterRateControl = unsafe { core::mem::zeroed() };
+        rc.min_qp = 52;
+        let rc_id = f.misc(va::VAEncMiscParameterTypeRateControl, &rc);
+        assert_eq!(f.begin(), 0);
+        assert_eq!(f.render(&mut [pps, rc_id]), 0);
+        assert_eq!(
+            unsafe { end_picture(&mut *f.ctx, f.context) },
+            va::VA_STATUS_ERROR_INVALID_PARAMETER as VAStatus
+        );
+        let pools = f.state.pools.lock();
+        let key = pools.contexts.find_by_low_bits(f.context).unwrap();
+        assert!(pools.contexts[key].session.lock().is_none());
     }
 
     #[test]

@@ -27,6 +27,8 @@ Tests must fail when required tools or hardware are unavailable. Validate exact
 frame counts, visible dimensions, profile and full-stream decoding. Fractional
 frame rate is checked against SPS timing. ABI integration covers dynamic rate
 changes, shared input across contexts, stale IDs and live-resource termination.
+Rate-control tests inspect H.264 slice QP against client limits, exercise
+explicit HRD and rate-control resets, and reject truncated parameter buffers.
 Image ABI tests compare full-frame and cropped NV12 readback byte for byte,
 exercise mapping access flags and copies between derived surfaces, and reject
 mapped buffers, invalid rectangles and stale surface handles.
@@ -35,6 +37,11 @@ surfaces and encoder, then decode each picture to verify pixel identity. Keep
 hardware ABI tests concurrent to exercise independently closing encoders.
 Increase `NVENC_TEST_FRAMES` for longer stability runs. Set `NVENC_TEST_DRIVER`
 to an existing shared library to run ABI controls without rebuilding it.
+`NVENC_TEST_QUEUED_FRAMES` extends the queued rate-update test from 12 to at
+most 600 pictures. It reports submission/completion time separately from full
+decoding and verifies frame identity after reverse-order coded-buffer mapping.
+Compare this workload only with the same geometry, controls and frame count;
+its timing is not a representative desktop-streaming FPS measurement.
 
 ## Performance
 

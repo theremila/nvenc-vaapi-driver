@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Compare paced H.264 VA-API/NVENC/CPU encoding; validate every output frame."""
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -43,7 +44,9 @@ def benchmark(mode: str, seconds: int, work: Path, pacing: str, *, drivers_path:
         "nvenc": ["-vf", "format=nv12", "-c:v", "h264_nvenc", "-gpu", gpu_index, "-preset", "p4", "-tune", "ull", "-rc", "cbr"],
         "cpu": ["-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency"],
     }
+    # Fix initial VBV fullness too; encoder defaults differ across backends.
     args += encoders[mode] + ["-b:v", "5M", "-maxrate", "5M", "-bufsize", "5M",
+                             "-rc_init_occupancy", "2500000",
                              "-bf", "0", "-g", "120", "-f", "h264", str(output)]
     samples = work / f"{mode}.gpu.csv"
     with samples.open("w") as stream:
@@ -81,7 +84,8 @@ def benchmark(mode: str, seconds: int, work: Path, pacing: str, *, drivers_path:
             "max_rss_mib": rss / 1024, "frames": seconds * 60,
             "mean_gpu_power_w": statistics.mean(r[0] for r in readings) if readings else None,
             "max_encoder_util_percent": max((r[1] for r in readings), default=None),
-            "output_bytes": output.stat().st_size}
+            "output_bytes": output.stat().st_size,
+            "output_sha256": hashlib.sha256(output.read_bytes()).hexdigest()}
 
 
 def main() -> None:
